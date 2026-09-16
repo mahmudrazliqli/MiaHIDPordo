@@ -18,12 +18,13 @@ endif
 clean:
 	@echo + OS = $(OS) 
 	@echo - shell uname= $(shell uname -s)
-	rm -rf *.o winicon/*.o *.exe main
+	rm -rf *.o *.exe main
 	
 program:all
 	./main
 	
-
+run:all
+	./main
 #in msys2
 # pacman -S mingw-w64-x86_64-libconfig
 #in ubuntu
