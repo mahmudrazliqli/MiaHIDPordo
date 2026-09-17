@@ -1,11 +1,13 @@
 #include <gtk/gtk.h>
 #include <hidapi/hidapi.h>
+#include <libconfig.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <wchar.h>
 #include <locale.h>
+#include <sys/stat.h>
 
 #define MAX_DESCRIPTOR_SIZE 4096
 #define MAX_DEVICES 128
@@ -20,6 +22,9 @@
 #define MANUAL_READ_STEP_MS 5         /* هر گام، mutex آزاد می‌شود */
 
 #define BITS_TO_BYTES(b) ((unsigned int)(((unsigned long long)(b) + 7ULL) / 8ULL))
+
+#define CFG_DIR    ".config"
+#define CFG_NAME   "miahidpordo.cfg"
 
 /* ---------- ساختارها ---------- */
 
@@ -46,8 +51,10 @@ typedef struct {
 typedef struct {
     GtkWidget *notebook, *status_label, *device_combo, *window, *hex_check;
     GtkWidget *connect_button, *refresh_button, *clear_button;
+    GtkWidget *auto_check;                 /* چک‌باکس اتصال خودکار */
 
     GPtrArray *device_paths;
+    GPtrArray *device_ids;                 /* شناسه پایدار: VID:PID[:Serial] */
 
     hid_device *dev;
     GMutex hid_mutex;
@@ -81,6 +88,7 @@ typedef struct {
 static gpointer reader_thread_func(gpointer data);
 static void stop_reader_thread(void);
 static void clear_tabs(void);
+static void connect_device(void);
 
 /* ---------- توابع کمکی ---------- */
 
@@ -204,6 +212,114 @@ static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
                                      mark, 0.0, FALSE, 0, 0);
         gtk_text_buffer_delete_mark(buf, mark);
     }
+}
+
+/* ---------- تنظیمات (libconfig) ---------- */
+
+static char *cfg_path = NULL;
+static char *pending_last_device = NULL;
+
+static const char *get_config_path(void) {
+    if (cfg_path) return cfg_path;
+    const char *home = g_get_home_dir();
+    if (!home || !*home) home = ".";
+    char *dir = g_build_filename(home, CFG_DIR, NULL);
+    g_mkdir_with_parents(dir, 0755);
+    cfg_path = g_build_filename(dir, CFG_NAME, NULL);
+    g_free(dir);
+    return cfg_path;
+}
+
+static void apply_pending_device(void) {
+    int target = -1;
+    if (pending_last_device && *pending_last_device && app.device_ids) {
+        for (int i = 0; i < (int)app.device_ids->len; i++) {
+            const char *id = g_ptr_array_index(app.device_ids, i);
+            if (id && strcmp(id, pending_last_device) == 0) { target = i; break; }
+        }
+    }
+    if (target < 0 && app.device_ids && app.device_ids->len > 0) target = 0;
+    if (target >= 0 && app.device_combo)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(app.device_combo), target);
+}
+
+static void load_config(void) {
+    config_t cfg;
+    config_init(&cfg);
+
+    if (!config_read_file(&cfg, get_config_path())) {
+        config_destroy(&cfg);
+        return;
+    }
+
+    int b = 0;
+    int w = 0, h = 0, x = -1, y = -1;
+
+    if (config_lookup_bool(&cfg, "hex_mode", &b) && app.hex_check)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.hex_check), b ? TRUE : FALSE);
+
+    if (config_lookup_bool(&cfg, "autoconnect", &b) && app.auto_check)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.auto_check), b ? TRUE : FALSE);
+
+    int has_w = config_lookup_int(&cfg, "window_width",  &w);
+    int has_h = config_lookup_int(&cfg, "window_height", &h);
+    int has_x = config_lookup_int(&cfg, "window_x",      &x);
+    int has_y = config_lookup_int(&cfg, "window_y",      &y);
+
+    if (app.window) {
+        if (has_w && has_h && w > 0 && h > 0)
+            gtk_window_resize(GTK_WINDOW(app.window), w, h);
+        if (has_x && has_y && x >= 0 && y >= 0)
+            gtk_window_move(GTK_WINDOW(app.window), x, y);
+    }
+
+    const char *last_dev = NULL;
+    if (config_lookup_string(&cfg, "last_device", &last_dev) && last_dev && *last_dev) {
+        g_free(pending_last_device);
+        pending_last_device = g_strdup(last_dev);
+    }
+
+    config_destroy(&cfg);
+}
+
+static void save_config(void) {
+    config_t cfg;
+    config_init(&cfg);
+    config_setting_t *root = config_root_setting(&cfg);
+    config_setting_t *s;
+
+    s = config_setting_add(root, "hex_mode", CONFIG_TYPE_BOOL);
+    config_setting_set_bool(s, is_hex_mode() ? 1 : 0);
+
+    int auto_on = 0;
+    if (app.auto_check)
+        auto_on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app.auto_check)) ? 1 : 0;
+    s = config_setting_add(root, "autoconnect", CONFIG_TYPE_BOOL);
+    config_setting_set_bool(s, auto_on);
+
+    int w = 0, h = 0, x = -1, y = -1;
+    if (app.window) {
+        gtk_window_get_size(GTK_WINDOW(app.window), &w, &h);
+        gtk_window_get_position(GTK_WINDOW(app.window), &x, &y);
+    }
+    s = config_setting_add(root, "window_width",  CONFIG_TYPE_INT); config_setting_set_int(s, w);
+    s = config_setting_add(root, "window_height", CONFIG_TYPE_INT); config_setting_set_int(s, h);
+    s = config_setting_add(root, "window_x",      CONFIG_TYPE_INT); config_setting_set_int(s, x);
+    s = config_setting_add(root, "window_y",      CONFIG_TYPE_INT); config_setting_set_int(s, y);
+
+    const char *dev_id = "";
+    if (app.device_combo && app.device_ids) {
+        int sel = gtk_combo_box_get_active(GTK_COMBO_BOX(app.device_combo));
+        if (sel >= 0 && sel < (int)app.device_ids->len) {
+            const char *id = g_ptr_array_index(app.device_ids, sel);
+            if (id) dev_id = id;
+        }
+    }
+    s = config_setting_add(root, "last_device", CONFIG_TYPE_STRING);
+    config_setting_set_string(s, dev_id);
+
+    config_write_file(&cfg, get_config_path());
+    config_destroy(&cfg);
 }
 
 /* ---------- تجزیه Report Descriptor ---------- */
@@ -903,6 +1019,7 @@ static void populate_devices(void) {
     GtkTreeIter iter;
 
     g_ptr_array_set_size(app.device_paths, 0);
+    if (app.device_ids) g_ptr_array_set_size(app.device_ids, 0);
 
     struct hid_device_info *devs = hid_enumerate(0, 0);
     int count = 0;
@@ -915,16 +1032,31 @@ static void populate_devices(void) {
         snprintf(label, sizeof(label), "%04x:%04x  %s %s",
                  cur->vendor_id, cur->product_id, mfg, prod);
 
+        /* شناسه پایدار برای بازیابی بین اجراها */
+        char dev_id[256];
+        if (cur->serial_number && *cur->serial_number) {
+            char ser[160];
+            wchar_to_locale(cur->serial_number, ser, sizeof(ser));
+            snprintf(dev_id, sizeof(dev_id), "%04x:%04x:%s",
+                     cur->vendor_id, cur->product_id, ser);
+        } else {
+            snprintf(dev_id, sizeof(dev_id), "%04x:%04x",
+                     cur->vendor_id, cur->product_id);
+        }
+
         gtk_list_store_append(store, &iter);
         gtk_list_store_set(store, &iter, 0, label, -1);
         g_ptr_array_add(app.device_paths, g_strdup(cur->path));
+        if (app.device_ids)
+            g_ptr_array_add(app.device_ids, g_strdup(dev_id));
         count++;
     }
     hid_free_enumeration(devs);
 
     gtk_combo_box_set_model(GTK_COMBO_BOX(app.device_combo), GTK_TREE_MODEL(store));
-    if (count > 0) gtk_combo_box_set_active(GTK_COMBO_BOX(app.device_combo), 0);
     g_object_unref(store);
+
+    apply_pending_device();   /* به‌جای set_active(0): انتخاب قبلی را بازیابی می‌کند */
 
     char msg[64];
     if (count)
@@ -956,7 +1088,8 @@ static void disconnect_device(void) {
     gtk_button_set_label(GTK_BUTTON(app.connect_button), "Connect");
     gtk_widget_set_sensitive(app.device_combo, TRUE);
     gtk_widget_set_sensitive(app.refresh_button, TRUE);
-    gtk_widget_set_sensitive(app.connect_button, app.device_paths->len > 0);
+    gtk_widget_set_sensitive(app.connect_button,
+                             app.device_paths && app.device_paths->len > 0);
 
     gtk_label_set_text(GTK_LABEL(app.status_label), "Disconnected");
 }
@@ -1063,12 +1196,28 @@ static void on_hex_toggled(GtkToggleButton *b, gpointer data) {
     gtk_label_set_text(GTK_LABEL(app.status_label), hex ? "Mode: HEX" : "Mode: ASCII");
 }
 
+/* ---------- auto-connect پس از نمایش پنجره ---------- */
+
+static gboolean auto_connect_idle(gpointer data) {
+    (void)data;
+    if (!app.auto_check) return G_SOURCE_REMOVE;
+    if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app.auto_check)))
+        return G_SOURCE_REMOVE;
+    if (!g_atomic_int_get(&app.connected) &&
+        app.device_paths && app.device_paths->len > 0)
+        connect_device();
+    return G_SOURCE_REMOVE;
+}
+
 /* ---------- window destroy handler ---------- */
 
 static void on_window_destroy(GtkWidget *w, gpointer d) {
     (void)w; (void)d;
     if (g_atomic_int_get(&app.shutting_down)) return;
     g_atomic_int_set(&app.shutting_down, 1);
+
+    /* ذخیره تنظیمات پیش از بستن منابع */
+    save_config();
 
     stop_reader_thread();
     g_atomic_int_set(&app.connected, 0);
@@ -1084,6 +1233,7 @@ static void on_window_destroy(GtkWidget *w, gpointer d) {
 
     clear_tabs();
     g_ptr_array_set_size(app.device_paths, 0);
+    if (app.device_ids) g_ptr_array_set_size(app.device_ids, 0);
 
     gtk_main_quit();
 }
@@ -1100,18 +1250,36 @@ int main(int argc, char *argv[]) {
 
     g_mutex_init(&app.hid_mutex);
     app.device_paths = g_ptr_array_new_with_free_func(g_free);
+    app.device_ids   = g_ptr_array_new_with_free_func(g_free);
     app.tabs_generation = 0;
     app.manual_reads_active = 0;
 
     gtk_init(&argc, &argv);
 
-    GError *err = NULL;
-    GtkBuilder *builder = gtk_builder_new();
-    if (!gtk_builder_add_from_file(builder, "window1.glade", &err)) {
-        g_printerr("Failed to load window1.glade: %s\n", err->message);
+
+
+
+        static const char *ui_paths[] = {
+            MIAHIDPORDO_DATA_DIR "/window1.glade",
+            "window1.glade",
+            NULL
+        };
+
+
+        GError *err = NULL;
+        GtkBuilder *builder = gtk_builder_new();
+        gboolean loaded = FALSE;
+
+        for (guint i = 0; ui_paths[i] && !loaded; i++)
+            if (g_file_test(ui_paths[i], G_FILE_TEST_EXISTS))
+                loaded = gtk_builder_add_from_file(builder, ui_paths[i], &err);
+
+    if (!loaded) {
+        g_printerr("MiaHIDPordo: Failed to load window1.glade: %s\n", err->message);
         g_error_free(err);
         g_object_unref(builder);
         g_ptr_array_free(app.device_paths, TRUE);
+        g_ptr_array_free(app.device_ids,   TRUE);
         g_mutex_clear(&app.hid_mutex);
         hid_exit();
         return 1;
@@ -1125,38 +1293,55 @@ int main(int argc, char *argv[]) {
     app.refresh_button = GTK_WIDGET(gtk_builder_get_object(builder, "refresh_button"));
     app.connect_button = GTK_WIDGET(gtk_builder_get_object(builder, "connect_button"));
     app.clear_button   = GTK_WIDGET(gtk_builder_get_object(builder, "clear_button"));
+    app.auto_check     = GTK_WIDGET(gtk_builder_get_object(builder, "check_autoconnect"));
 
     if (!app.window || !app.device_combo || !app.notebook || !app.status_label ||
         !app.hex_check || !app.refresh_button || !app.connect_button || !app.clear_button) {
         g_printerr("Error: Failed to find required widgets in glade file\n");
         g_object_unref(builder);
         g_ptr_array_free(app.device_paths, TRUE);
+        g_ptr_array_free(app.device_ids,   TRUE);
         g_mutex_clear(&app.hid_mutex);
         hid_exit();
         return 1;
     }
 
+    /* چک‌باکس اتوکانکت در glade بدون برچسب است؛ برچسب را در کد اضافه می‌کنیم */
+    if (app.auto_check && !gtk_button_get_label(GTK_BUTTON(app.auto_check)))
+        gtk_button_set_label(GTK_BUTTON(app.auto_check), "Auto");
+
     GtkCellRenderer *rend = gtk_cell_renderer_text_new();
     gtk_cell_layout_pack_start(GTK_CELL_LAYOUT(app.device_combo), rend, TRUE);
     gtk_cell_layout_set_attributes(GTK_CELL_LAYOUT(app.device_combo), rend, "text", 0, NULL);
 
-    g_signal_connect(app.refresh_button , "clicked", G_CALLBACK(on_refresh_clicked  ), NULL);
-    g_signal_connect(app.connect_button , "clicked", G_CALLBACK(on_connect_clicked  ), NULL);
-    g_signal_connect(app.clear_button   , "clicked", G_CALLBACK(on_clear_clicked    ), NULL);
-    g_signal_connect(app.hex_check      , "toggled", G_CALLBACK(on_hex_toggled      ), NULL);
-    g_signal_connect(app.window         , "destroy", G_CALLBACK(on_window_destroy   ), NULL);
+    g_signal_connect(app.refresh_button , "clicked", G_CALLBACK(on_refresh_clicked ), NULL);
+    g_signal_connect(app.connect_button , "clicked", G_CALLBACK(on_connect_clicked ), NULL);
+    g_signal_connect(app.clear_button   , "clicked", G_CALLBACK(on_clear_clicked   ), NULL);
+    g_signal_connect(app.hex_check      , "toggled", G_CALLBACK(on_hex_toggled     ), NULL);
+    g_signal_connect(app.window         , "destroy", G_CALLBACK(on_window_destroy  ), NULL);
 
+    /* پیش‌فرض اولیه */
     g_atomic_int_set(&app.hex_mode, 0);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.hex_check), FALSE);
 
     g_object_unref(builder);
 
+    /* بازیابی تنظیمات ذخیره‌شده (قبل از populate تا last_device اعمال شود) */
+    load_config();
+
     populate_devices();
     gtk_widget_show_all(app.window);
+
+    /* اتصال خودکار پس از نمایش پنجره */
+    g_idle_add(auto_connect_idle, NULL);
+
     gtk_main();
 
     g_ptr_array_free(app.device_paths, TRUE);
+    g_ptr_array_free(app.device_ids,   TRUE);
     g_mutex_clear(&app.hid_mutex);
+    g_free(cfg_path);
+    g_free(pending_last_device);
     hid_exit();
     return 0;
 }

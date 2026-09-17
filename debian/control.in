@@ -1,0 +1,14 @@
+Package: miaHIDpordo
+Version: @VERSION@
+Section: electronics
+Priority: optional
+Architecture: @ARCH@
+Depends: @GTK@, @GLIB@, shared-mime-info
+Maintainer: Bir <bir@localhost>
+Description: MiaHIDPordo - GTK3 HIDl port monitor and terminal
+ MiaHIDPordo opens a HIDl port (ttyS*, ttyUSB*, ttyACM*...),
+ shows received data as text or hex dump with selectable line
+ endings, highlights control characters (\n, \r ...), can send
+ data and reconnect automatically at startup.
+ .
+ Settings are persisted with libconfig to ~/.config/miaHIDpordo.cfg.

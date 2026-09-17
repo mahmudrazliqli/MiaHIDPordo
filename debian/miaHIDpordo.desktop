@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=MiaHIDPordo
+GenericName=HIDl Port Monitor
+Comment=Monitor and talk to HIDl ports (ttyUSB, ttyACM, ttyS)
+Exec=miaHIDpordo
+Icon=miaHIDpordo
+Terminal=false
+Categories=Development;Electronics;GTK;
+Keywords=HIDl;uart;rs232;terminal;hex;
+StartupNotify=true
+Name[en_US]=Mia HID Pordo
