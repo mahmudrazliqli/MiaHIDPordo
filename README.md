@@ -1,4 +1,4 @@
-# Mia HID Pordo 10.0
+# Mia HID Pordo 11.0
 
 A lightweight GTK3 + hidapi desktop application for interacting with USB HID devices. It parses the device **Report Descriptor**, creates a tab per **Report ID**, and lets you send **Output** reports, **Set/Get Feature** reports, and **Read Input** reports — in **HEX** or **ASCII** mode.
 
@@ -94,33 +94,6 @@ gcc -O2 -Wall -Wextra -pthread main.c -o mia_hid_pordo \
 > pkg-config --list-all | grep -i hid
 > ```
 
-### Makefile (optional)
-
-```makefile
-CC      ?= gcc
-CFLAGS  ?= -O2 -Wall -Wextra -pthread
-PKGS     = gtk+-3.0 hidapi-hidraw gthread-2.0
-
-mia_hid_pordo: main.c
-	$(CC) $(CFLAGS) main.c -o $@ $(shell pkg-config --cflags --libs $(PKGS))
-
-clean:
-	rm -f mia_hid_pordo
-
-.PHONY: clean
-```
-
----
-
-## ▶️ Run
-
-The program loads its UI from **`window1.glade`**, so it must be launched from the directory that contains that file (or you can change the path in `main.c`).
-
-```bash
-./mia_hid_pordo
-```
-
----
 
 ## 🚀 Usage
 
