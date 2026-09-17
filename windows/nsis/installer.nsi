@@ -5,8 +5,8 @@
 ; General Information
 !define PRODUCT_NAME "MiaHIDPordo"
 !define PRODUCT_VERSION "1.0"
-!define PRODUCT_PUBLISHER "Your Company"
-!define PRODUCT_WEB_SITE "http://www.yourcompany.com"
+!define PRODUCT_PUBLISHER "MiaPordo"
+!define PRODUCT_WEB_SITE "https://mahmudrazliqli.github.io/"
 !define PRODUCT_DIR_REGKEY "Software\Microsoft\Windows\CurrentVersion\App Paths\MiaHIDPordo.exe"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 !define PRODUCT_UNINST_ROOT_KEY "HKLM"
@@ -59,7 +59,7 @@ Section "MainSection" SEC01
   
   ; Install main files
   File "MiaHIDPordo.exe"
-  File "windows1.glade"
+  File "window1.glade"
   File "MiaHIDPordo.ico"
   
   ; Install all dll files
@@ -92,7 +92,7 @@ SectionEnd
 Section Uninstall
   ; Delete files
   Delete "$INSTDIR\MiaHIDPordo.exe"
-  Delete "$INSTDIR\windows1.glade"
+  Delete "$INSTDIR\window1.glade"
   Delete "$INSTDIR\MiaHIDPordo.ico"
   Delete "$INSTDIR\*.dll"
   Delete "$INSTDIR\uninst.exe"
