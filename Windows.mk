@@ -6,7 +6,7 @@ all: clean
 
 	gcc main.c `pkg-config --cflags gtk+-3.0` -c -o main.o
 	windres -I. -i windows/application/resource.rc -o windows/application/resource.o
-	gcc main.o windows/application/resource.o `pkg-config --libs gtk+-3.0` -mwindows -lws2_32 -lshlwapi -lsetupapi -lconfig -o main
+	gcc main.o windows/application/resource.o `pkg-config --libs gtk+-3.0` -mwindows -lws2_32 -lshlwapi -lsetupapi -lconfig  -lhidapi -o main
 	rm -f windows/application/resource.o
 	rm -f *.o
 	cp main $(APP_NAME)
@@ -21,7 +21,7 @@ program:all
 ifeq ($(OS), Windows_NT)	
 	cp windows/Application/application.ico  windows/nsis/$(APP_NAME).ico
 	cp main windows/nsis/$(APP_NAME)
-	cp windows1.glade windows/nsis/windows1.glade
+	cp window1.glade windows/nsis/window1.glade
 	7z x windows/nsis/dlls.7z -owindows/nsis -y;
 	rm -f windows/nsis/uninst.exe
 	cd windows/nsis && makensis installer.nsi

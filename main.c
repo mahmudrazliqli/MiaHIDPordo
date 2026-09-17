@@ -26,6 +26,10 @@
 #define CFG_DIR    ".config"
 #define CFG_NAME   "miahidpordo.cfg"
 
+#ifndef MIAHIDPORDO_DATA_DIR
+#define MIAHIDPORDO_DATA_DIR "."
+#endif
+
 /* ---------- ساختارها ---------- */
 
 typedef struct {
