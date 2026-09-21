@@ -653,7 +653,12 @@ static gboolean deliver_manual_read(gpointer data) {
     if (!tab || tab != r->tab) return G_SOURCE_REMOVE;
 
     if (r->len > 0) {
-        route_input_data(r->data, r->len, r->has_rid, "READ");
+        /* 
+         * hid_get_input_report همیشه Report ID را در بایت اول برمی‌گرداند،
+         * حتی وقتی Report ID واقعی صفر است. پس اینجا has_rid را 1 می‌گذاریم
+         * تا route_input_data بایت اول را به عنوان Report ID در نظر بگیرد.
+         */
+        route_input_data(r->data, r->len, 1 /* has_report_id */, "READ");
     } else if (r->len == 0) {
         log_to_tab(tab, "READ", "timeout (no data)");
     } else {
@@ -679,7 +684,17 @@ static gpointer manual_read_thread(gpointer data) {
             g_mutex_unlock(&app.hid_mutex);
             break;
         }
-        int n = hid_read(dev, r->data, MAX_READ_BUF);   /* non-blocking */
+
+        /* --- تغییر: استفاده از Control Read به جای hid_read --- */
+        unsigned char buf[MAX_READ_BUF];
+        memset(buf, 0, sizeof(buf));
+        buf[0] = r->has_rid ? r->rid : 0x00;   /* Report ID در بایت اول */
+
+        int want = (int)r->tab->sizes.input_bytes + 1;  /* +1 برای Report ID */
+        if (want > MAX_READ_BUF) want = MAX_READ_BUF;
+
+        int n = hid_get_input_report(dev, buf, want);
+
         if (n < 0) {
             r->len = -1;
             snprintf(r->errmsg, sizeof(r->errmsg), "%s", hid_err_str_locked(dev));
@@ -688,7 +703,11 @@ static gpointer manual_read_thread(gpointer data) {
         }
         g_mutex_unlock(&app.hid_mutex);
 
-        if (n > 0) { r->len = n; break; }
+        if (n > 0) {
+            memcpy(r->data, buf, n);
+            r->len = n;
+            break;
+        }
 
         g_usleep(MANUAL_READ_STEP_MS * 1000);
         waited_ms += MANUAL_READ_STEP_MS;
@@ -728,7 +747,6 @@ static void on_read_input(GtkButton *b, gpointer data) {
     }
     g_thread_unref(t);
 }
-
 /* ---------- Feature: Set / Get ---------- */
 
 static void on_send_feature(GtkButton *b, gpointer data) {
