@@ -52,3 +52,8 @@ deb: all
 	dpkg-deb --root-owner-group --build $(STAGE) $(DEBFILE)
 	rm -rf $(STAGE) .deb
 	@echo "############### Built $(DEBFILE) OK ###################"
+	
+	
+
+#in ubuntu
+#sudo apt install libhidapi-dev 

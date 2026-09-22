@@ -34,5 +34,5 @@ endif
 	
 #pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-gtk3 mingw-w64-x86_64-libconfig
 #pacman -S mingw-w64-x86_64-nsis p7zip
-#in ubuntu
-#sudo apt install libhidapi-dev 
+
+

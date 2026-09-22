@@ -17,9 +17,9 @@
 #define MAX_REPORT_BYTES 1024
 #define MAX_READ_BUF (MAX_REPORT_BYTES + 1)
 #define MAX_GLOBAL_STACK 4
-#define READER_POLL_SLEEP_US 1000     /* 1ms بین پول‌ها در حالت بی‌داده */
-#define MANUAL_READ_TIMEOUT_MS 300    /* کل زمان انتظار manual read */
-#define MANUAL_READ_STEP_MS 5         /* هر گام، mutex آزاد می‌شود */
+#define READER_POLL_SLEEP_US 1000     // 1ms
+#define MANUAL_READ_TIMEOUT_MS 300    // کل زمان انتظار manual read */
+#define MANUAL_READ_STEP_MS 5         // هر گام، mutex آزاد می‌شود */
 
 #define BITS_TO_BYTES(b) ((unsigned int)(((unsigned long long)(b) + 7ULL) / 8ULL))
 
@@ -55,10 +55,9 @@ typedef struct {
 typedef struct {
     GtkWidget *notebook, *status_label, *device_combo, *window, *hex_check;
     GtkWidget *connect_button, *refresh_button, *clear_button;
-    GtkWidget *auto_check;                 /* چک‌باکس اتصال خودکار */
-
+    GtkWidget *auto_check;                
     GPtrArray *device_paths;
-    GPtrArray *device_ids;                 /* شناسه پایدار: VID:PID[:Serial] */
+    GPtrArray *device_ids;                 //  VID:PID[:Serial] 
 
     hid_device *dev;
     GMutex hid_mutex;
@@ -218,7 +217,7 @@ static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
     }
 }
 
-/* ---------- تنظیمات (libconfig) ---------- */
+/* ---------- settings (libconfig) ---------- */
 
 static char *cfg_path = NULL;
 static char *pending_last_device = NULL;
@@ -326,7 +325,7 @@ static void save_config(void) {
     config_destroy(&cfg);
 }
 
-/* ---------- تجزیه Report Descriptor ---------- */
+/* ---------- parsing Report Descriptor ---------- */
 
 typedef struct {
     unsigned int report_size;
@@ -334,8 +333,7 @@ typedef struct {
     unsigned char report_id;
 } GlobalState;
 
-static void parse_report_descriptor(const unsigned char *desc, int len,
-                                    ReportSizes *out_sizes, int *has_report_id) {
+static void parse_report_descriptor(const unsigned char *desc, int len, ReportSizes *out_sizes, int *has_report_id) {
     GlobalState cur = {0, 0, 0};
     GlobalState stack[MAX_GLOBAL_STACK];
     int sp = 0;
@@ -399,8 +397,7 @@ static void parse_report_descriptor(const unsigned char *desc, int len,
 
 /* ---------- مسیردهی داده‌ی ورودی ---------- */
 
-static void route_input_data(const unsigned char *buf, int n,
-                             int has_report_id, const char *prefix) {
+static void route_input_data(const unsigned char *buf, int n, int has_report_id, const char *prefix) {
     char msg[HEX_BUF_SIZE + 256];
     char disp[HEX_BUF_SIZE];
     int offset = 0;
@@ -484,7 +481,7 @@ static gboolean sync_op_done(gpointer data) {
             snprintf(msg, sizeof(msg), "hid_write short: %d of %d bytes", op->bytes, expect);
         else
             snprintf(msg, sizeof(msg), "SENT (%d bytes): %s", op->payload_len, disp);
-        log_to_tab(tab, "OUT", msg);
+        log_to_tab(tab, "OUT ", msg);
 
     } else if (op->op == OP_FEATURE_SET) {
         format_bytes(op->payload, op->payload_len, disp, sizeof(disp));
@@ -495,7 +492,7 @@ static gboolean sync_op_done(gpointer data) {
             snprintf(msg, sizeof(msg), "hid_send_feature_report short: %d of %d bytes",
                      op->bytes, expect);
         else
-            snprintf(msg, sizeof(msg), "SET (%d bytes): %s", op->payload_len, disp);
+            snprintf(msg, sizeof(msg), "SET  (%d bytes): %s", op->payload_len, disp);
         log_to_tab(tab, "FEAT", msg);
 
     } else { /* OP_FEATURE_GET */
@@ -507,7 +504,7 @@ static gboolean sync_op_done(gpointer data) {
             int payload_len = op->bytes - 1;
             if (payload_len < 0) payload_len = 0;
             format_bytes(op->resp + 1, payload_len, disp, sizeof(disp));
-            snprintf(msg, sizeof(msg), "GET (%d bytes): %s", payload_len, disp);
+            snprintf(msg, sizeof(msg), "GET  (%d bytes): %s", payload_len, disp);
         }
         log_to_tab(tab, "FEAT", msg);
     }
@@ -596,25 +593,25 @@ static void on_send_output(GtkButton *b, gpointer data) {
     (void)b;
     ReportBOX *tab = (ReportBOX *)data;
     if (!g_atomic_int_get(&app.connected)) {
-        log_to_tab(tab, "OUT", "not connected");
+        log_to_tab(tab, "OUT ", "not connected");
         return;
     }
     if (tab->sizes.output_bytes == 0) {
-        log_to_tab(tab, "OUT", "this report has no Output capability");
+        log_to_tab(tab, "OUT ", "this report has no Output capability");
         return;
     }
 
     const char *txt = gtk_entry_get_text(GTK_ENTRY(tab->output_entry));
     unsigned char buf[MAX_REPORT_BYTES];
     int n = parse_input(txt, buf, sizeof(buf));
-    if (n == 0) { log_to_tab(tab, "OUT", "(empty)"); return; }
+    if (n == 0) { log_to_tab(tab, "OUT ", "(empty)"); return; }
 
     if (n > (int)tab->sizes.output_bytes) {
         char warn[160];
         snprintf(warn, sizeof(warn),
                  "WARNING: %d bytes > max %u bytes (sending anyway)",
                  n, tab->sizes.output_bytes);
-        log_to_tab(tab, "OUT", warn);
+        log_to_tab(tab, "OUT ", warn);
     }
 
     SyncOp *op = g_new0(SyncOp, 1);
@@ -626,7 +623,7 @@ static void on_send_output(GtkButton *b, gpointer data) {
     op->report_id = tab->report_id;
     op->has_report_id = tab->has_report_id;
 
-    start_sync_op(op, "OUT");
+    start_sync_op(op, "OUT ");
 }
 
 /* ---------- Read Input (manual) ---------- */
@@ -822,7 +819,7 @@ static gboolean deliver_input(gpointer data) {
     if (!g_atomic_int_get(&app.connected))
         return G_SOURCE_REMOVE;
     if (ev->len > 0)
-        route_input_data(ev->data, ev->len, ev->has_report_id, "IN");
+        route_input_data(ev->data, ev->len, ev->has_report_id, "IN  ");
     return G_SOURCE_REMOVE;
 }
 
