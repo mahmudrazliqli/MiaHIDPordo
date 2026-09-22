@@ -1113,6 +1113,7 @@ static void disconnect_device(void) {
     gtk_label_set_text(GTK_LABEL(app.status_label), "Disconnected");
 }
 
+
 static void connect_device(void) {
     int sel = gtk_combo_box_get_active(GTK_COMBO_BOX(app.device_combo));
     if (sel < 0 || sel >= (int)app.device_paths->len) {
@@ -1157,29 +1158,48 @@ static void connect_device(void) {
 
     build_tabs(desc, n);
 
-    g_atomic_int_set(&app.reader_running, 1);
-    app.reader_thread = g_thread_new("hid_reader", reader_thread_func, &app);
-    if (!app.reader_thread) {
+    /*
+     * بررسی می‌کنیم که آیا اصلاً Input Report وجود دارد یا نه.
+     * دستگاه‌هایی که فقط Feature (یا Output) دارند معمولاً
+     * Interrupt IN endpoint ندارند و hid_read روی آن‌ها خطا می‌دهد.
+     * در آن صورت reader thread را اصلاً اجرا نمی‌کنیم.
+     */
+    int has_input = 0;
+    for (int i = 0; i < MAX_REPORT_ID; i++) {
+        if (app.main_sizes[i].input_bytes > 0) { has_input = 1; break; }
+    }
+
+    if (has_input) {
+        g_atomic_int_set(&app.reader_running, 1);
+        app.reader_thread = g_thread_new("hid_reader", reader_thread_func, &app);
+        if (!app.reader_thread) {
+            g_atomic_int_set(&app.reader_running, 0);
+            g_atomic_int_set(&app.connected, 0);
+            g_mutex_lock(&app.hid_mutex);
+            if (app.dev) { hid_close(app.dev); app.dev = NULL; }
+            g_mutex_unlock(&app.hid_mutex);
+            clear_tabs();
+            gtk_label_set_text(GTK_LABEL(app.status_label),
+                               "Failed to start reader thread");
+            gtk_widget_set_sensitive(app.device_combo, TRUE);
+            gtk_widget_set_sensitive(app.refresh_button, TRUE);
+            gtk_button_set_label(GTK_BUTTON(app.connect_button), "Connect");
+            return;
+        }
+    } else {
+        app.reader_thread = NULL;
         g_atomic_int_set(&app.reader_running, 0);
-        g_atomic_int_set(&app.connected, 0);
-        g_mutex_lock(&app.hid_mutex);
-        if (app.dev) { hid_close(app.dev); app.dev = NULL; }
-        g_mutex_unlock(&app.hid_mutex);
-        clear_tabs();
-        gtk_label_set_text(GTK_LABEL(app.status_label), "Failed to start reader thread");
-        gtk_widget_set_sensitive(app.device_combo, TRUE);
-        gtk_widget_set_sensitive(app.refresh_button, TRUE);
-        gtk_button_set_label(GTK_BUTTON(app.connect_button), "Connect");
-        return;
     }
 
     gtk_button_set_label(GTK_BUTTON(app.connect_button), "Disconnect");
     gtk_widget_set_sensitive(app.device_combo, FALSE);
     gtk_widget_set_sensitive(app.refresh_button, FALSE);
 
-    char status[160];
-    snprintf(status, sizeof(status), "Connected. Descriptor: %d bytes, %d tab(s)",
-             n, app.tab_count);
+    char status[200];
+    snprintf(status, sizeof(status),
+             "Connected. Descriptor: %d bytes, %d tab(s)%s",
+             n, app.tab_count,
+             has_input ? "" : " (Feature/Output only, no reader)");
     gtk_label_set_text(GTK_LABEL(app.status_label), status);
 }
 
