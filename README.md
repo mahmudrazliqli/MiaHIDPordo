@@ -1,4 +1,4 @@
-# Mia HID Pordo 12.0
+# Mia HID Pordo 13.2
 
 A lightweight GTK3 + hidapi desktop application for interacting with USB HID devices. It parses the device **Report Descriptor**, creates a tab per **Report ID**, and lets you send **Output** reports, **Set/Get Feature** reports, and **Read Input** reports — in **HEX** or **ASCII** mode.
 

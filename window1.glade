@@ -4,7 +4,7 @@
   <requires lib="gtk+" version="3.24"/>
   <object class="GtkWindow" id="main_window">
     <property name="can-focus">False</property>
-    <property name="title">Mia HID Pordo 12.0</property>
+    <property name="title">Mia HID Pordo</property>
     <property name="default-width">450</property>
     <property name="default-height">640</property>
     <child>
@@ -15,6 +15,10 @@
         <child>
           <object class="GtkBox" id="toolbar_box">
             <property name="can-focus">False</property>
+            <property name="margin-start">1</property>
+            <property name="margin-end">1</property>
+            <property name="margin-top">1</property>
+            <property name="margin-bottom">1</property>
             <property name="spacing">6</property>
             <child>
               <object class="GtkCheckButton" id="check_autoconnect">
@@ -98,6 +102,7 @@
           <packing>
             <property name="expand">False</property>
             <property name="fill">True</property>
+            <property name="padding">3</property>
             <property name="position">0</property>
           </packing>
         </child>

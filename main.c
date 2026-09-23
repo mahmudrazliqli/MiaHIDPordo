@@ -1345,6 +1345,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+
+	gtk_window_set_title(GTK_WINDOW(app.window), WINTITLE);
     /* چک‌باکس اتوکانکت در glade بدون برچسب است؛ برچسب را در کد اضافه می‌کنیم */
     if (app.auto_check && !gtk_button_get_label(GTK_BUTTON(app.auto_check)))
         gtk_button_set_label(GTK_BUTTON(app.auto_check), "Auto");
@@ -1352,6 +1354,7 @@ int main(int argc, char *argv[]) {
     GtkCellRenderer *rend = gtk_cell_renderer_text_new();
     gtk_cell_layout_pack_start(GTK_CELL_LAYOUT(app.device_combo), rend, TRUE);
     gtk_cell_layout_set_attributes(GTK_CELL_LAYOUT(app.device_combo), rend, "text", 0, NULL);
+    
 
     g_signal_connect(app.refresh_button , "clicked", G_CALLBACK(on_refresh_clicked ), NULL);
     g_signal_connect(app.connect_button , "clicked", G_CALLBACK(on_connect_clicked ), NULL);
