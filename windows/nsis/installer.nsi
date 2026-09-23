@@ -4,7 +4,7 @@
 ;--------------------------------
 ; General Information
 !define PRODUCT_NAME "MiaHIDPordo"
-!define PRODUCT_VERSION "13.2"
+!define PRODUCT_VERSION "14.0"
 !define PRODUCT_PUBLISHER "MiaPordo"
 !define PRODUCT_WEB_SITE "https://mahmudrazliqli.github.io/"
 !define PRODUCT_DIR_REGKEY "Software\Microsoft\Windows\CurrentVersion\App Paths\${PRODUCT_NAME}.exe"
@@ -59,7 +59,6 @@ Section "MainSection" SEC01
   
   ; Install main files
   File "${PRODUCT_NAME}.exe"
-  File "window1.glade"
   File "${PRODUCT_NAME}.ico"
   
   ; Install all dll files
@@ -92,7 +91,6 @@ SectionEnd
 Section Uninstall
   ; Delete files
   Delete "$INSTDIR\${PRODUCT_NAME}.exe"
-  Delete "$INSTDIR\window1.glade"
   Delete "$INSTDIR\${PRODUCT_NAME}.ico"
   Delete "$INSTDIR\*.dll"
   Delete "$INSTDIR\uninst.exe"
