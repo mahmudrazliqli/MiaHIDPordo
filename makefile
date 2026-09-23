@@ -36,17 +36,17 @@ endif
 	
 clean:
 	rm -rf main *.o  *.exe $(TARGET)  
-	rm -rf windows/nsis/*.ico windows/nsis/*.exe windows/nsis/*.dll  windows/nsis/*.glade 
-	rm -rf $(TARGET) *.o main .deb *.deb
+	@rm -rf windows/nsis/*.ico windows/nsis/*.exe windows/nsis/*.dll  windows/nsis/*.glade 
+	@rm -rf $(TARGET) *.o main .deb *.deb
 ####################################################################################################################
 ifeq ($(shell uname -s),Linux)
   ifneq ($(wildcard /etc/debian_version),)
-program: all deb
+program: deb
 PREFIX   := /usr
 DEBARCH  := $(shell dpkg --print-architecture 2>/dev/null || echo amd64)
 STAGE    := .deb/$(TARGET)-$(VERSION)
 DEBFILE  := $(TARGET)_$(VERSION)_$(DEBARCH).deb
-deb:
+deb:all
 	@echo "######################   DEB BASED LINUX   ##########################"
 	@mkdir -p $(STAGE)/DEBIAN $(STAGE)$(PREFIX)/bin $(STAGE)$(PREFIX)/share/$(TARGET) $(STAGE)$(PREFIX)/share/icons/hicolor/scalable/apps $(STAGE)$(PREFIX)/share/doc/$(TARGET) $(STAGE)$(PREFIX)/share/applications
 	@install -m 0755 $(TARGET) $(STAGE)$(PREFIX)/bin/$(TARGET)
@@ -75,7 +75,7 @@ program:all
 	rm -f windows/nsis/uninst.exe
 	cd windows/nsis && makensis installer.nsi
 	mv windows/nsis/$(TARGET)_Setup.exe ./$(TITLE)_$(VERSION)_Setup.exe
-	@rm -f windows/nsis/*.ico windows/nsis/*.exe windows/nsis/*.dll  windows/nsis/*.glade 
+	@rm -f windows/nsis/*.ico windows/nsis/*.exe windows/nsis/*.dll  windows/nsis/*.glade  .deb
 	@echo "#############   $(TITLE)_$(VERSION)_Setup.exe  IS READY  ####################"
 endif
 #pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-gtk3 mingw-w64-x86_64-libconfig mingw-w64-x86_64-nsis p7zip
