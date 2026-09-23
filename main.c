@@ -23,13 +23,13 @@
 
 #define BITS_TO_BYTES(b) ((unsigned int)(((unsigned long long)(b) + 7ULL) / 8ULL))
 
+//-DTARGET='"any appname"'  makefile
+
 #define CFG_DIR    ".config"
-#define CFG_NAME   "miahidpordo.cfg"
+#define CFG_NAME   TARGET ".cfg" 
 
-#ifndef MIAHIDPORDO_DATA_DIR
-#define MIAHIDPORDO_DATA_DIR "."
-#endif
-
+#define RES_GLADE "/org/" TARGET "/window1.glade"
+#define RES_CSS   "/org/" TARGET "/style.css"
 /* ---------- ساختارها ---------- */
 
 typedef struct {
@@ -1297,25 +1297,16 @@ int main(int argc, char *argv[]) {
 
 
 
-
-        static const char *ui_paths[] = {
-            MIAHIDPORDO_DATA_DIR "/window1.glade",
-            "window1.glade",
-            NULL
-        };
-
-
-        GError *err = NULL;
-        GtkBuilder *builder = gtk_builder_new();
-        gboolean loaded = FALSE;
-
-        for (guint i = 0; ui_paths[i] && !loaded; i++)
-            if (g_file_test(ui_paths[i], G_FILE_TEST_EXISTS))
-                loaded = gtk_builder_add_from_file(builder, ui_paths[i], &err);
-
+    /* Load UI + CSS from GResource.
+     * These resources are compiled from resources/resources.gresource.xml
+     * (registered automatically via the constructor emitted by
+     *  glib-compile-resources --generate-source). */
+    GError *err = NULL;
+    GtkBuilder *builder = gtk_builder_new();
+	gboolean loaded = gtk_builder_add_from_resource(builder, RES_GLADE, &err);
     if (!loaded) {
-        g_printerr("MiaHIDPordo: Failed to load window1.glade: %s\n", err->message);
-        g_error_free(err);
+		g_printerr("Failed to load %s: %s\n",RES_GLADE, err ? err->message : "unknown error");
+        if (err) g_error_free(err);
         g_object_unref(builder);
         g_ptr_array_free(app.device_paths, TRUE);
         g_ptr_array_free(app.device_ids,   TRUE);
@@ -1323,6 +1314,15 @@ int main(int argc, char *argv[]) {
         hid_exit();
         return 1;
     }
+
+    /* Apply stylesheet from the same resource bundle. */
+    GtkCssProvider *css = gtk_css_provider_new();
+    gtk_css_provider_load_from_resource(css,RES_CSS);
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(),
+        GTK_STYLE_PROVIDER(css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(css);
 
     app.window         = GTK_WIDGET(gtk_builder_get_object(builder, "main_window"));
     app.device_combo   = GTK_WIDGET(gtk_builder_get_object(builder, "device_combo"));

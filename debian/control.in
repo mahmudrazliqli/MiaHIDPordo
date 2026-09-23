@@ -1,4 +1,4 @@
-Package: miaHIDpordo
+Package: miahidpordo
 Version: @VERSION@
 Section: electronics
 Priority: optional
@@ -8,4 +8,4 @@ Maintainer: Bir <bir@localhost>
 Description: MiaHIDPordo - GTK3 HID device monitor and terminal
  MiaHIDPordo opens a HID device
  supports output, input and feature.
- Settings are persisted with libconfig to ~/.config/miaHIDpordo.cfg.
+ Settings are persisted with libconfig to ~/.config/miahidpordo.cfg.

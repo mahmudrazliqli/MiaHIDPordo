@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=MiaHIDPordo
+GenericName=HID device Monitor
+Comment=Monitor and talk to HID devices
+Exec=miahidpordo
+Icon=miahidpordo
+Terminal=false
+Categories=Development;Electronics;GTK;
+Keywords=HIDl;usb;hid;terminal;hex;
+StartupNotify=true
+Name[en_US]=MiaHIDPordo
