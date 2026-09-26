@@ -606,12 +606,22 @@ static void on_send_output(GtkButton *b, gpointer data) {
     int n = parse_input(txt, buf, sizeof(buf));
     if (n == 0) { log_to_tab(tab, "OUT ", "(empty)"); return; }
 
-    if (n > (int)tab->sizes.output_bytes) {
+    int target = (int)tab->sizes.output_bytes;
+    if (target > MAX_REPORT_BYTES) target = MAX_REPORT_BYTES;
+
+    if (n > target) {
         char warn[160];
         snprintf(warn, sizeof(warn),
-                 "WARNING: %d bytes > max %u bytes (sending anyway)",
-                 n, tab->sizes.output_bytes);
+                 "WARNING: %d bytes > max %d bytes (sending anyway)", n, target);
         log_to_tab(tab, "OUT ", warn);
+    } else if (n < target) {
+        char warn[160];
+        snprintf(warn, sizeof(warn),
+                 "WARNING: %d bytes < %d bytes (padding with \\0 )", n, target);
+        log_to_tab(tab, "OUT ", warn);
+        for (int i = n; i < target; i++)
+            buf[i] = 0;
+        n = target;
     }
 
     SyncOp *op = g_new0(SyncOp, 1);
@@ -625,7 +635,6 @@ static void on_send_output(GtkButton *b, gpointer data) {
 
     start_sync_op(op, "OUT ");
 }
-
 /* ---------- Read Input (manual) ---------- */
 
 typedef struct {
@@ -744,6 +753,7 @@ static void on_read_input(GtkButton *b, gpointer data) {
     }
     g_thread_unref(t);
 }
+
 /* ---------- Feature: Set / Get ---------- */
 
 static void on_send_feature(GtkButton *b, gpointer data) {
@@ -763,12 +773,22 @@ static void on_send_feature(GtkButton *b, gpointer data) {
     int n = parse_input(txt, buf, sizeof(buf));
     if (n == 0) { log_to_tab(tab, "FEAT", "(empty)"); return; }
 
-    if (n > (int)tab->sizes.feature_bytes) {
+    int target = (int)tab->sizes.feature_bytes;
+    if (target > MAX_REPORT_BYTES) target = MAX_REPORT_BYTES;
+
+    if (n > target) {
         char warn[160];
         snprintf(warn, sizeof(warn),
-                 "WARNING: %d bytes > max %u bytes (sending anyway)",
-                 n, tab->sizes.feature_bytes);
+                 "WARNING: %d bytes > max %d bytes (sending anyway)", n, target);
         log_to_tab(tab, "FEAT", warn);
+    } else if (n < target) {
+        char warn[160];
+        snprintf(warn, sizeof(warn),
+                 "WARNING: %d bytes < %d bytes (padding with \\0)", n, target);
+        log_to_tab(tab, "FEAT", warn);
+        for (int i = n; i < target; i++)
+            buf[i] = 0;
+        n = target;
     }
 
     SyncOp *op = g_new0(SyncOp, 1);
