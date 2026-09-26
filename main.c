@@ -186,17 +186,41 @@ static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
     if (!tab || !tab->input_buf) return;
     GtkTextBuffer *buf = tab->input_buf;
 
-    GtkTextIter end;
-    gtk_text_buffer_get_end_iter(buf, &end);
+    /* --- ساخت (یا بازیابی) تگ متادیتا روی همین بافر --- */
+    GtkTextTagTable *tags = gtk_text_buffer_get_tag_table(buf);
+    GtkTextTag *tag_meta = gtk_text_tag_table_lookup(tags, "meta");
+    if (!tag_meta) {
+        tag_meta = gtk_text_buffer_create_tag(buf, "meta",
+                                              "foreground", "#1565C0",     /* آبی */
+                                              "scale",      PANGO_SCALE_X_SMALL,
+                                              NULL);
+    }
 
+    /* --- ساخت خط لاگ --- */
     char line[HEX_BUF_SIZE + 256];
     int len = snprintf(line, sizeof(line), "[%s] %s\n", prefix, text);
     if (len < 0) len = 0;
     if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
-    gtk_text_buffer_insert(buf, &end, line, len);
 
+    /* --- پیدا کردن مرز بین متادیتا و payload --- */
+    static const char *marker = "bytes): ";
+    const char *split = g_strstr_len(line, len, marker);
+    int meta_len = split ? (int)((split - line) + strlen(marker)) : len;
+
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(buf, &end);
+
+    if (split) {
+        /* متادیتا با تگ، payload بدون تگ */
+        gtk_text_buffer_insert_with_tags(buf, &end, line, meta_len, tag_meta, NULL);
+        gtk_text_buffer_insert(buf, &end, line + meta_len, len - meta_len);
+    } else {
+        /* کل خط متادیتا (پیام خطا / timeout / ...) */
+        gtk_text_buffer_insert_with_tags(buf, &end, line, len, tag_meta, NULL);
+    }
+
+    /* --- حذف خطوط اضافی --- */
     tab->log_lines++;
-
     while (tab->log_lines > MAX_LOG_LINES) {
         GtkTextIter start, cut;
         gtk_text_buffer_get_start_iter(buf, &start);
@@ -206,6 +230,7 @@ static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
         tab->log_lines--;
     }
 
+    /* --- اسکرول به انتها --- */
     gtk_text_buffer_get_end_iter(buf, &end);
     gtk_text_buffer_place_cursor(buf, &end);
 
@@ -216,7 +241,6 @@ static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
         gtk_text_buffer_delete_mark(buf, mark);
     }
 }
-
 /* ---------- settings (libconfig) ---------- */
 
 static char *cfg_path = NULL;
