@@ -192,7 +192,7 @@ static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
     if (!tag_meta) {
         tag_meta = gtk_text_buffer_create_tag(buf, "meta",
                                               "foreground", "#1565C0",     /* آبی */
-                                              "scale",      PANGO_SCALE_X_SMALL,
+                                              "scale",      PANGO_SCALE_SMALL,
                                               NULL);
     }
 
