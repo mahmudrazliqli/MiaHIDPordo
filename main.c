@@ -62,6 +62,7 @@ typedef struct {
     GtkWidget *connect_button, *refresh_button, *clear_button;
     GtkWidget *auto_check;                
     GtkWidget *show_descriptor_button;
+    GtkWidget *pause_button;
     GPtrArray *device_paths;
     GPtrArray *device_ids;                 // VID:PID[:Serial]
 
@@ -77,6 +78,7 @@ typedef struct {
 
     GThread *reader_thread;
     gint reader_running;
+    gint reader_paused;
     gint shutting_down;
     gint hex_mode;
 
@@ -889,6 +891,7 @@ static gboolean on_reader_failed(gpointer data) {
     g_mutex_unlock(&app.hid_mutex);
 
     g_atomic_int_set(&app.connected, 0);
+    g_atomic_int_set(&app.reader_paused, 0);
     clear_tabs();
 
     if (app.status_label)
@@ -912,6 +915,14 @@ static gpointer reader_thread_func(gpointer data) {
     gint gen = g_atomic_int_get(&a->tabs_generation);
 
     while (g_atomic_int_get(&a->reader_running)) {
+
+        /* When paused: don't call hid_read at all so interrupt
+         * reports stay queued in the device and are not consumed. */
+        if (g_atomic_int_get(&a->reader_paused)) {
+            g_usleep(READER_POLL_SLEEP_US * 10);
+            continue;
+        }
+
         int n = 0;
         char errbuf[256] = {0};
 
@@ -955,6 +966,39 @@ static void stop_reader_thread(void) {
         g_thread_join(app.reader_thread);
         app.reader_thread = NULL;
     }
+}
+
+/* ---------- Pause button ---------- */
+
+static void update_pause_button(void) {
+    if (!app.pause_button) return;
+
+    gint paused = g_atomic_int_get(&app.reader_paused);
+    GtkWidget *img = gtk_bin_get_child(GTK_BIN(app.pause_button));
+    if (img && GTK_IS_IMAGE(img)) {
+        gtk_image_set_from_icon_name(
+            GTK_IMAGE(img),
+            paused ? "media-playback-start" : "media-playback-pause",
+            GTK_ICON_SIZE_BUTTON);
+    }
+}
+
+static void on_pause_clicked(GtkButton *b, gpointer data) {
+    (void)b; (void)data;
+
+    if (!g_atomic_int_get(&app.connected)) {
+        gtk_label_set_text(GTK_LABEL(app.status_label),
+                           "Not connected — nothing to pause");
+        return;
+    }
+
+    gint paused = !g_atomic_int_get(&app.reader_paused);
+    g_atomic_int_set(&app.reader_paused, paused);
+
+    update_pause_button();
+
+    gtk_label_set_text(GTK_LABEL(app.status_label),
+                       paused ? "Input paused" : "Input resumed");
 }
 
 /* ---------- View construction ---------- */
@@ -1326,10 +1370,9 @@ static void log_multiline_to_tab(ReportBOX *tab, const char *text) {
 
 static void on_show_descriptor(GtkButton *b, gpointer data) {
     (void)b; (void)data;
-
+	clear_all_logs();
     if (!app.raw_descriptor || app.raw_descriptor_len <= 0) {
-        gtk_label_set_text(GTK_LABEL(app.status_label),
-                           "No descriptor available (connect first)");
+        gtk_label_set_text(GTK_LABEL(app.status_label),"No descriptor available (connect first)");
         return;
     }
 
@@ -1438,6 +1481,8 @@ static void disconnect_device(void) {
     g_mutex_unlock(&app.hid_mutex);
 
     g_atomic_int_set(&app.connected, 0);
+    g_atomic_int_set(&app.reader_paused, 0);
+    update_pause_button();
     clear_tabs();
 
     g_free(app.raw_descriptor);
@@ -1500,6 +1545,10 @@ static void connect_device(void) {
     app.dev = dev;
     g_mutex_unlock(&app.hid_mutex);
     g_atomic_int_set(&app.connected, 1);
+
+    /* Reset pause state and refresh icon on (re)connect */
+    g_atomic_int_set(&app.reader_paused, 0);
+    update_pause_button();
 
     build_tabs(desc, n);
 
@@ -1710,10 +1759,11 @@ int main(int argc, char *argv[]) {
     app.auto_check     = GTK_WIDGET(gtk_builder_get_object(builder, "check_autoconnect"));
     app.show_descriptor_button =
                          GTK_WIDGET(gtk_builder_get_object(builder, "show_descriptor_button"));
+    app.pause_button   = GTK_WIDGET(gtk_builder_get_object(builder, "pause_button"));
 
     if (!app.window || !app.device_combo || !app.notebook || !app.status_label ||
         !app.hex_check || !app.refresh_button || !app.connect_button ||
-        !app.clear_button || !app.show_descriptor_button) {
+        !app.clear_button || !app.show_descriptor_button || !app.pause_button) {
         g_printerr("Error: Failed to find required widgets in glade file\n");
         g_object_unref(builder);
         g_ptr_array_free(app.device_paths, TRUE);
@@ -1738,13 +1788,15 @@ int main(int argc, char *argv[]) {
     g_signal_connect(app.connect_button , "clicked", G_CALLBACK(on_connect_clicked ), NULL);
     g_signal_connect(app.clear_button   , "clicked", G_CALLBACK(on_clear_clicked   ), NULL);
     g_signal_connect(app.hex_check      , "toggled", G_CALLBACK(on_hex_toggled     ), NULL);
-    g_signal_connect(app.show_descriptor_button, "clicked",
-                     G_CALLBACK(on_show_descriptor), NULL);
+    g_signal_connect(app.show_descriptor_button, "clicked", G_CALLBACK(on_show_descriptor), NULL);
+    g_signal_connect(app.pause_button   , "clicked", G_CALLBACK(on_pause_clicked   ), NULL);
     g_signal_connect(app.window         , "destroy", G_CALLBACK(on_window_destroy  ), NULL);
 
     /* Initial defaults */
     g_atomic_int_set(&app.hex_mode, 0);
+    g_atomic_int_set(&app.reader_paused, 0);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.hex_check), FALSE);
+    update_pause_button();
 
     g_object_unref(builder);
 
