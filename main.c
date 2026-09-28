@@ -18,8 +18,8 @@
 #define MAX_READ_BUF (MAX_REPORT_BYTES + 1)
 #define MAX_GLOBAL_STACK 4
 #define READER_POLL_SLEEP_US 1000     // 1ms
-#define MANUAL_READ_TIMEOUT_MS 300    // کل زمان انتظار manual read */
-#define MANUAL_READ_STEP_MS 5         // هر گام، mutex آزاد می‌شود */
+#define MANUAL_READ_TIMEOUT_MS 300    // Total wait time for manual read
+#define MANUAL_READ_STEP_MS 5         // Each step, mutex is released
 
 #define BITS_TO_BYTES(b) ((unsigned int)(((unsigned long long)(b) + 7ULL) / 8ULL))
 
@@ -30,7 +30,8 @@
 
 #define RES_GLADE "/org/" TARGET "/window1.glade"
 #define RES_CSS   "/org/" TARGET "/style.css"
-/* ---------- ساختارها ---------- */
+
+/* ---------- Structures ---------- */
 
 typedef struct {
     unsigned int input_bytes;
@@ -46,6 +47,10 @@ typedef struct {
     GtkTextBuffer *input_buf;
     GtkWidget *output_entry;
     GtkWidget *feature_entry;
+    GtkWidget *send_btn;
+    GtkWidget *read_btn;
+    GtkWidget *set_feat_btn;
+    GtkWidget *get_feat_btn;
     unsigned char report_id;
     int has_report_id;
     ReportSizes sizes;
@@ -56,8 +61,9 @@ typedef struct {
     GtkWidget *notebook, *status_label, *device_combo, *window, *hex_check;
     GtkWidget *connect_button, *refresh_button, *clear_button;
     GtkWidget *auto_check;                
+    GtkWidget *show_descriptor_button;
     GPtrArray *device_paths;
-    GPtrArray *device_ids;                 //  VID:PID[:Serial] 
+    GPtrArray *device_ids;                 // VID:PID[:Serial]
 
     hid_device *dev;
     GMutex hid_mutex;
@@ -75,6 +81,9 @@ typedef struct {
     gint hex_mode;
 
     gint manual_reads_active;
+
+    unsigned char *raw_descriptor;
+    int raw_descriptor_len;
 } App;
 
 static App app;
@@ -93,7 +102,7 @@ static void stop_reader_thread(void);
 static void clear_tabs(void);
 static void connect_device(void);
 
-/* ---------- توابع کمکی ---------- */
+/* ---------- Helper functions ---------- */
 
 static int is_hex_mode(void) {
     return g_atomic_int_get(&app.hex_mode);
@@ -186,23 +195,23 @@ static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
     if (!tab || !tab->input_buf) return;
     GtkTextBuffer *buf = tab->input_buf;
 
-    /* --- ساخت (یا بازیابی) تگ متادیتا روی همین بافر --- */
+    /* --- Create (or retrieve) metadata tag on this buffer --- */
     GtkTextTagTable *tags = gtk_text_buffer_get_tag_table(buf);
     GtkTextTag *tag_meta = gtk_text_tag_table_lookup(tags, "meta");
     if (!tag_meta) {
         tag_meta = gtk_text_buffer_create_tag(buf, "meta",
-                                              "foreground", "#1565C0",     /* آبی */
-                                              "scale",      PANGO_SCALE_SMALL,
+                                              "foreground", "#1565C0",     /* blue */
+                                              "scale",      PANGO_SCALE_X_SMALL,
                                               NULL);
     }
 
-    /* --- ساخت خط لاگ --- */
+    /* --- Build log line --- */
     char line[HEX_BUF_SIZE + 256];
     int len = snprintf(line, sizeof(line), "[%s] %s\n", prefix, text);
     if (len < 0) len = 0;
     if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
 
-    /* --- پیدا کردن مرز بین متادیتا و payload --- */
+    /* --- Find boundary between metadata and payload --- */
     static const char *marker = "bytes): ";
     const char *split = g_strstr_len(line, len, marker);
     int meta_len = split ? (int)((split - line) + strlen(marker)) : len;
@@ -211,15 +220,15 @@ static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
     gtk_text_buffer_get_end_iter(buf, &end);
 
     if (split) {
-        /* متادیتا با تگ، payload بدون تگ */
+        /* Metadata with tag, payload without tag */
         gtk_text_buffer_insert_with_tags(buf, &end, line, meta_len, tag_meta, NULL);
         gtk_text_buffer_insert(buf, &end, line + meta_len, len - meta_len);
     } else {
-        /* کل خط متادیتا (پیام خطا / timeout / ...) */
+        /* Entire line is metadata (error message / timeout / ...) */
         gtk_text_buffer_insert_with_tags(buf, &end, line, len, tag_meta, NULL);
     }
 
-    /* --- حذف خطوط اضافی --- */
+    /* --- Remove extra lines --- */
     tab->log_lines++;
     while (tab->log_lines > MAX_LOG_LINES) {
         GtkTextIter start, cut;
@@ -230,7 +239,7 @@ static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
         tab->log_lines--;
     }
 
-    /* --- اسکرول به انتها --- */
+    /* --- Scroll to end --- */
     gtk_text_buffer_get_end_iter(buf, &end);
     gtk_text_buffer_place_cursor(buf, &end);
 
@@ -241,6 +250,7 @@ static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
         gtk_text_buffer_delete_mark(buf, mark);
     }
 }
+
 /* ---------- settings (libconfig) ---------- */
 
 static char *cfg_path = NULL;
@@ -419,7 +429,7 @@ static void parse_report_descriptor(const unsigned char *desc, int len, ReportSi
     }
 }
 
-/* ---------- مسیردهی داده‌ی ورودی ---------- */
+/* ---------- Input data routing ---------- */
 
 static void route_input_data(const unsigned char *buf, int n, int has_report_id, const char *prefix) {
     char msg[HEX_BUF_SIZE + 256];
@@ -457,7 +467,7 @@ static void route_input_data(const unsigned char *buf, int n, int has_report_id,
     }
 }
 
-/* ---------- عملیات HID روی thread جدا (Output / Feature Set / Feature Get) ---------- */
+/* ---------- HID operations on separate thread (Output / Feature Set / Feature Get) ---------- */
 
 enum {
     OP_OUTPUT,
@@ -470,16 +480,16 @@ typedef struct {
     gint generation;
     int op;
 
-    /* ورودی */
+    /* Input */
     unsigned char payload[MAX_REPORT_BYTES];
     int payload_len;
     unsigned char report_id;
     int has_report_id;
-    int read_len;                 /* فقط برای OP_FEATURE_GET */
+    int read_len;                 /* Only for OP_FEATURE_GET */
 
-    /* خروجی */
-    int status;                   /* 0 = OK، -1 = خطا */
-    int bytes;                    /* برای write: نوشته‌شده؛ برای get: خوانده‌شده */
+    /* Output */
+    int status;                   /* 0 = OK, -1 = error */
+    int bytes;                    /* For write: written; for get: read */
     unsigned char resp[MAX_READ_BUF];
     char errmsg[256];
 } SyncOp;
@@ -659,6 +669,7 @@ static void on_send_output(GtkButton *b, gpointer data) {
 
     start_sync_op(op, "OUT ");
 }
+
 /* ---------- Read Input (manual) ---------- */
 
 typedef struct {
@@ -684,9 +695,9 @@ static gboolean deliver_manual_read(gpointer data) {
 
     if (r->len > 0) {
         /* 
-         * hid_get_input_report همیشه Report ID را در بایت اول برمی‌گرداند،
-         * حتی وقتی Report ID واقعی صفر است. پس اینجا has_rid را 1 می‌گذاریم
-         * تا route_input_data بایت اول را به عنوان Report ID در نظر بگیرد.
+         * hid_get_input_report always returns the Report ID in the first byte,
+         * even when the actual Report ID is zero. So here we set has_rid to 1
+         * so that route_input_data considers the first byte as the Report ID.
          */
         route_input_data(r->data, r->len, 1 /* has_report_id */, "READ");
     } else if (r->len == 0) {
@@ -703,7 +714,7 @@ static gpointer manual_read_thread(gpointer data) {
     ManualReadResult *r = (ManualReadResult *)data;
     int waited_ms = 0;
 
-    r->len = 0;   /* پیش‌فرض: timeout */
+    r->len = 0;   /* Default: timeout */
 
     while (waited_ms < MANUAL_READ_TIMEOUT_MS) {
         g_mutex_lock(&app.hid_mutex);
@@ -715,12 +726,12 @@ static gpointer manual_read_thread(gpointer data) {
             break;
         }
 
-        /* --- تغییر: استفاده از Control Read به جای hid_read --- */
+        /* --- Change: use Control Read instead of hid_read --- */
         unsigned char buf[MAX_READ_BUF];
         memset(buf, 0, sizeof(buf));
-        buf[0] = r->has_rid ? r->rid : 0x00;   /* Report ID در بایت اول */
+        buf[0] = r->has_rid ? r->rid : 0x00;   /* Report ID in first byte */
 
-        int want = (int)r->tab->sizes.input_bytes + 1;  /* +1 برای Report ID */
+        int want = (int)r->tab->sizes.input_bytes + 1;  /* +1 for Report ID */
         if (want > MAX_READ_BUF) want = MAX_READ_BUF;
 
         int n = hid_get_input_report(dev, buf, want);
@@ -854,7 +865,7 @@ static void on_get_feature(GtkButton *b, gpointer data) {
     start_sync_op(op, "FEAT");
 }
 
-/* ---------- تحویل داده از thread به GTK ---------- */
+/* ---------- Deliver data from thread to GTK ---------- */
 
 static gboolean deliver_input(gpointer data) {
     ReadEvent *ev = (ReadEvent *)data;
@@ -893,7 +904,7 @@ static gboolean on_reader_failed(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
-/* ---------- Thread خواندن (non-blocking polling) ---------- */
+/* ---------- Reader thread (non-blocking polling) ---------- */
 
 static gpointer reader_thread_func(gpointer data) {
     App *a = (App *)data;
@@ -908,7 +919,7 @@ static gpointer reader_thread_func(gpointer data) {
         hid_device *dev = a->dev;
         if (dev && g_atomic_int_get(&a->connected) &&
             g_atomic_int_get(&a->reader_running)) {
-            /* non-blocking read — بلافاصله برمی‌گردد */
+            /* non-blocking read — returns immediately */
             n = hid_read(dev, buf, sizeof(buf));
             if (n < 0)
                 snprintf(errbuf, sizeof(errbuf), "%s", hid_err_str_locked(dev));
@@ -931,7 +942,7 @@ static gpointer reader_thread_func(gpointer data) {
             }
             break;
         } else {
-            /* n == 0: هنوز داده‌ای نیست، کوتاه بخواب تا بقیه فرصت کنند */
+            /* n == 0: no data yet, sleep briefly to give others a chance */
             g_usleep(READER_POLL_SLEEP_US);
         }
     }
@@ -946,7 +957,7 @@ static void stop_reader_thread(void) {
     }
 }
 
-/* ---------- ساخت ویو ---------- */
+/* ---------- View construction ---------- */
 
 static GtkWidget *make_terminal_view(GtkWidget **out_view) {
     GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
@@ -960,7 +971,7 @@ static GtkWidget *make_terminal_view(GtkWidget **out_view) {
     return scrolled;
 }
 
-/* ---------- مدیریت تب‌ها ---------- */
+/* ---------- Tab management ---------- */
 
 static void clear_tabs(void) {
     stop_reader_thread();
@@ -1032,17 +1043,19 @@ static void build_tabs(const unsigned char *desc, int len)
                              G_CALLBACK(on_send_output), tab);
             gtk_box_pack_start(GTK_BOX(hbox), tab->output_entry, TRUE, TRUE, 0);
 
-            GtkWidget *send = gtk_button_new_with_label("Send");
-            gtk_widget_set_size_request(send, 120, -1);
-            g_signal_connect(send, "clicked", G_CALLBACK(on_send_output), tab);
-            gtk_box_pack_start(GTK_BOX(hbox), send, FALSE, FALSE, 0);
+            tab->send_btn = gtk_button_new_with_label("Send");
+            gtk_widget_set_size_request(tab->send_btn, 140, -1);
+            g_signal_connect(tab->send_btn, "clicked",
+                             G_CALLBACK(on_send_output), tab);
+            gtk_box_pack_start(GTK_BOX(hbox), tab->send_btn, FALSE, FALSE, 0);
         }
 
         if (tab->sizes.input_bytes) {
-            GtkWidget *read_in_btn = gtk_button_new_with_label("Read");
-            gtk_widget_set_size_request(read_in_btn, 120, -1);
-            g_signal_connect(read_in_btn, "clicked", G_CALLBACK(on_read_input), tab);
-            gtk_box_pack_start(GTK_BOX(hbox), read_in_btn, FALSE, FALSE, 0);
+            tab->read_btn = gtk_button_new_with_label("Read");
+            gtk_widget_set_size_request(tab->read_btn, 140, -1);
+            g_signal_connect(tab->read_btn, "clicked",
+                             G_CALLBACK(on_read_input), tab);
+            gtk_box_pack_start(GTK_BOX(hbox), tab->read_btn, FALSE, FALSE, 0);
         }
 
         GtkWidget *hbox2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
@@ -1052,15 +1065,17 @@ static void build_tabs(const unsigned char *desc, int len)
             gtk_entry_set_placeholder_text(GTK_ENTRY(tab->feature_entry), ph);
             gtk_box_pack_start(GTK_BOX(hbox2), tab->feature_entry, TRUE, TRUE, 0);
 
-            GtkWidget *set_btn = gtk_button_new_with_label("Set Feature");
-            gtk_widget_set_size_request(set_btn, 120, -1);
-            g_signal_connect(set_btn, "clicked", G_CALLBACK(on_send_feature), tab);
-            gtk_box_pack_start(GTK_BOX(hbox2), set_btn, FALSE, FALSE, 0);
+            tab->set_feat_btn = gtk_button_new_with_label("Set Feature");
+            gtk_widget_set_size_request(tab->set_feat_btn, 140, -1);
+            g_signal_connect(tab->set_feat_btn, "clicked",
+                             G_CALLBACK(on_send_feature), tab);
+            gtk_box_pack_start(GTK_BOX(hbox2), tab->set_feat_btn, FALSE, FALSE, 0);
 
-            GtkWidget *get_btn = gtk_button_new_with_label("Get Feature");
-            gtk_widget_set_size_request(get_btn, 120, -1);
-            g_signal_connect(get_btn, "clicked", G_CALLBACK(on_get_feature), tab);
-            gtk_box_pack_start(GTK_BOX(hbox2), get_btn, FALSE, FALSE, 0);
+            tab->get_feat_btn = gtk_button_new_with_label("Get Feature");
+            gtk_widget_set_size_request(tab->get_feat_btn, 140, -1);
+            g_signal_connect(tab->get_feat_btn, "clicked",
+                             G_CALLBACK(on_get_feature), tab);
+            gtk_box_pack_start(GTK_BOX(hbox2), tab->get_feat_btn, FALSE, FALSE, 0);
         }
 
         gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
@@ -1075,7 +1090,284 @@ static void build_tabs(const unsigned char *desc, int len)
     }
 }
 
-/* ---------- دستگاه ---------- */
+/* ---------- HID Report Descriptor formatter ---------- */
+
+static const char *usage_page_name(unsigned int page) {
+    switch (page) {
+        case 0x01: return "Generic Desktop";
+        case 0x02: return "Simulation Controls";
+        case 0x03: return "VR Controls";
+        case 0x04: return "Sport Controls";
+        case 0x05: return "Game Controls";
+        case 0x06: return "Generic Device";
+        case 0x07: return "Keyboard/Keypad";
+        case 0x08: return "LED";
+        case 0x09: return "Button";
+        case 0x0A: return "Ordinal";
+        case 0x0B: return "Telephony";
+        case 0x0C: return "Consumer";
+        case 0x0D: return "Digitizer";
+        case 0x0E: return "Haptics";
+        case 0x0F: return "Physical Input Device";
+        case 0x10: return "Unicode";
+        case 0x14: return "Alphanumeric Display";
+        case 0x40: return "Medical Instruments";
+        case 0x80: return "Monitor";
+        case 0x84: return "Power";
+        case 0x85: return "Battery System";
+        case 0x8C: return "Bar Code Scanner";
+        case 0x8D: return "Scale";
+        default:   return NULL;
+    }
+}
+
+static const char *usage_name(unsigned int page, unsigned int usage) {
+    if (page == 0x01) {                    /* Generic Desktop */
+        switch (usage) {
+            case 0x00: return "Undefined";
+            case 0x01: return "Pointer";
+            case 0x02: return "Mouse";
+            case 0x04: return "Joystick";
+            case 0x05: return "Game Pad";
+            case 0x06: return "Keyboard";
+            case 0x07: return "Keypad";
+            case 0x08: return "Multi-axis Controller";
+            case 0x30: return "X";
+            case 0x31: return "Y";
+            case 0x32: return "Z";
+            case 0x33: return "Rx";
+            case 0x34: return "Ry";
+            case 0x35: return "Rz";
+            case 0x36: return "Slider";
+            case 0x37: return "Dial";
+            case 0x38: return "Wheel";
+            case 0x39: return "Hat switch";
+        }
+    }
+    return NULL;
+}
+
+/* Output: multiline GString with hex + comments */
+static GString *format_descriptor(const unsigned char *desc, int len) {
+    GString *out = g_string_new(NULL);
+    int i = 0;
+    int depth = 0;
+    unsigned int last_usage_page = 0;
+
+    while (i < len) {
+        int start = i;
+        unsigned char prefix = desc[i++];
+
+        /* Long item (0xFE) — rare */
+        if (prefix == 0xFE) {
+            if (i + 1 >= len) break;
+            int dlen = desc[i];
+            if (i + 2 + dlen > len) break;
+            i += 2 + dlen;
+            continue;
+        }
+
+        int size_code = prefix & 3;
+        int type      = (prefix >> 2) & 3;
+        int tag       = (prefix >> 4) & 0xF;
+        int data_size = (size_code == 3) ? 4 : size_code;
+
+        unsigned int data = 0;
+        for (int b = 0; b < data_size && i < len; b++)
+            data |= ((unsigned int)desc[i++]) << (8 * b);
+
+        /* Hex part */
+        GString *hex = g_string_new(NULL);
+        for (int k = start; k < i; k++)
+            g_string_append_printf(hex, "0x%02x, ", desc[k]);
+        while (hex->len < 26) g_string_append_c(hex, ' ');
+
+        /* Indentation based on collection depth */
+        GString *indent = g_string_new(NULL);
+        for (int d = 0; d < depth + 1; d++) g_string_append(indent, "    ");
+
+        const char *item_name = "?";
+        char extra[160] = {0};
+
+        if (type == 0) {                    /* Main */
+            switch (tag) {
+                case 0x8: item_name = "INPUT";           break;
+                case 0x9: item_name = "OUTPUT";          break;
+                case 0xB: item_name = "FEATURE";         break;
+                case 0xA: {
+                    item_name = "COLLECTION";
+                    const char *cn = NULL;
+                    switch (data) {
+                        case 0x00: cn = "Physical";        break;
+                        case 0x01: cn = "Application";     break;
+                        case 0x02: cn = "Logical";         break;
+                        case 0x03: cn = "Report";          break;
+                        case 0x04: cn = "Named Array";     break;
+                        case 0x05: cn = "Usage Switch";    break;
+                        case 0x06: cn = "Usage Modifier";  break;
+                    }
+                    if (cn) snprintf(extra, sizeof(extra), "%s", cn);
+                    break;
+                }
+                case 0xC: item_name = "END_COLLECTION";  break;
+                default:  item_name = "MAIN";            break;
+            }
+        } else if (type == 1) {             /* Global */
+            switch (tag) {
+                case 0x0: {
+                    item_name = "USAGE_PAGE";
+                    const char *n = usage_page_name(data);
+                    if (n) snprintf(extra, sizeof(extra), "%s", n);
+                    else if (data >= 0xFF00)
+                        snprintf(extra, sizeof(extra), "Vendor Defined (0x%04X)", data);
+                    last_usage_page = data;
+                    break;
+                }
+                case 0x1: item_name = "LOGICAL_MINIMUM";  break;
+                case 0x2: item_name = "LOGICAL_MAXIMUM";  break;
+                case 0x3: item_name = "PHYSICAL_MINIMUM"; break;
+                case 0x4: item_name = "PHYSICAL_MAXIMUM"; break;
+                case 0x5: item_name = "UNIT_EXPONENT";    break;
+                case 0x6: item_name = "UNIT";             break;
+                case 0x7: item_name = "REPORT_SIZE";      break;
+                case 0x8: item_name = "REPORT_ID";        break;
+                case 0x9: item_name = "REPORT_COUNT";     break;
+                case 0xA: item_name = "PUSH";             break;
+                case 0xB: item_name = "POP";              break;
+                default:  item_name = "GLOBAL";           break;
+            }
+        } else if (type == 2) {             /* Local */
+            switch (tag) {
+                case 0x0: {
+                    item_name = "USAGE";
+                    const char *n = usage_name(last_usage_page, data);
+                    if (n) snprintf(extra, sizeof(extra), "%s", n);
+                    break;
+                }
+                case 0x1: item_name = "USAGE_MINIMUM";      break;
+                case 0x2: item_name = "USAGE_MAXIMUM";      break;
+                case 0x3: item_name = "DESIGNATOR_INDEX";   break;
+                case 0x4: item_name = "DESIGNATOR_MINIMUM"; break;
+                case 0x5: item_name = "DESIGNATOR_MAXIMUM"; break;
+                case 0x7: item_name = "STRING_INDEX";       break;
+                case 0x8: item_name = "STRING_MINIMUM";     break;
+                case 0x9: item_name = "STRING_MAXIMUM";     break;
+                case 0xA: item_name = "DELIMITER";          break;
+                default:  item_name = "LOCAL";              break;
+            }
+        } else {
+            item_name = "RESERVED";
+        }
+
+        /* END_COLLECTION is printed one level back */
+        if (type == 0 && tag == 0xC && depth > 0) {
+            depth--;
+            g_string_set_size(indent, 0);
+            for (int d = 0; d < depth + 1; d++) g_string_append(indent, "    ");
+        }
+
+        g_string_append_printf(out, "%s%s// %s",
+                               indent->str, hex->str, item_name);
+        if (extra[0]) g_string_append_printf(out, " (%s)", extra);
+        g_string_append_c(out, '\n');
+
+        /* COLLECTION goes one level forward */
+        if (type == 0 && tag == 0xA) depth++;
+
+        g_string_free(hex,    TRUE);
+        g_string_free(indent, TRUE);
+    }
+    return out;
+}
+
+/* Multiline log: like log_to_tab but inserts the whole text at once. */
+static void log_multiline_to_tab(ReportBOX *tab, const char *text) {
+    if (!tab || !tab->input_buf || !text) return;
+    GtkTextBuffer *buf = tab->input_buf;
+
+    GtkTextTagTable *tags = gtk_text_buffer_get_tag_table(buf);
+    GtkTextTag *tag_meta = gtk_text_tag_table_lookup(tags, "meta");
+    if (!tag_meta) {
+        tag_meta = gtk_text_buffer_create_tag(buf, "meta",
+                                              "foreground", "#1565C0",
+                                              "scale",      PANGO_SCALE_X_SMALL,
+                                              NULL);
+    }
+
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(buf, &end);
+    gtk_text_buffer_insert_with_tags(buf, &end, text, -1, tag_meta, NULL);
+
+    int added = 1;
+    for (const char *p = text; *p; p++) if (*p == '\n') added++;
+    tab->log_lines += added;
+
+    while (tab->log_lines > MAX_LOG_LINES) {
+        GtkTextIter start, cut;
+        gtk_text_buffer_get_start_iter(buf, &start);
+        cut = start;
+        if (!gtk_text_iter_forward_line(&cut)) break;
+        gtk_text_buffer_delete(buf, &start, &cut);
+        tab->log_lines--;
+    }
+
+    gtk_text_buffer_get_end_iter(buf, &end);
+    gtk_text_buffer_place_cursor(buf, &end);
+
+    if (tab->input_view) {
+        GtkTextMark *mark = gtk_text_buffer_create_mark(buf, NULL, &end, FALSE);
+        gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(tab->input_view),
+                                     mark, 0.0, FALSE, 0, 0);
+        gtk_text_buffer_delete_mark(buf, mark);
+    }
+}
+
+/* ---------- Show Report Descriptor ---------- */
+
+static void on_show_descriptor(GtkButton *b, gpointer data) {
+    (void)b; (void)data;
+
+    if (!app.raw_descriptor || app.raw_descriptor_len <= 0) {
+        gtk_label_set_text(GTK_LABEL(app.status_label),
+                           "No descriptor available (connect first)");
+        return;
+    }
+
+    /* ReportBOX of current tab */
+    ReportBOX *tab = NULL;
+    if (app.notebook) {
+        int page = gtk_notebook_get_current_page(GTK_NOTEBOOK(app.notebook));
+        if (page >= 0) {
+            GtkWidget *child = gtk_notebook_get_nth_page(
+                                   GTK_NOTEBOOK(app.notebook), page);
+            if (child)
+                tab = g_object_get_data(G_OBJECT(child), "report_box");
+        }
+    }
+    if (!tab) {
+        for (int i = 0; i < MAX_REPORT_ID; i++)
+            if (app.tabs[i]) { tab = app.tabs[i]; break; }
+    }
+    if (!tab) {
+        gtk_label_set_text(GTK_LABEL(app.status_label),
+                           "No report tab to display descriptor");
+        return;
+    }
+
+    char hdr[96];
+    snprintf(hdr, sizeof(hdr), "HID Report Descriptor (%d bytes)",
+             app.raw_descriptor_len);
+    log_to_tab(tab, "DESC", hdr);
+
+    GString *s = format_descriptor(app.raw_descriptor, app.raw_descriptor_len);
+    log_multiline_to_tab(tab, s->str);
+    g_string_free(s, TRUE);
+
+    gtk_label_set_text(GTK_LABEL(app.status_label),
+                       "HID Report Descriptor logged");
+}
+
+/* ---------- Device ---------- */
 
 static void populate_devices(void) {
     GtkListStore *store = gtk_list_store_new(1, G_TYPE_STRING);
@@ -1095,7 +1387,7 @@ static void populate_devices(void) {
         snprintf(label, sizeof(label), "%04x:%04x  %s %s",
                  cur->vendor_id, cur->product_id, mfg, prod);
 
-        /* شناسه پایدار برای بازیابی بین اجراها */
+        /* Stable identifier for restoration between runs */
         char dev_id[256];
         if (cur->serial_number && *cur->serial_number) {
             char ser[160];
@@ -1119,7 +1411,7 @@ static void populate_devices(void) {
     gtk_combo_box_set_model(GTK_COMBO_BOX(app.device_combo), GTK_TREE_MODEL(store));
     g_object_unref(store);
 
-    apply_pending_device();   /* به‌جای set_active(0): انتخاب قبلی را بازیابی می‌کند */
+    apply_pending_device();   /* Instead of set_active(0): restores previous selection */
 
     char msg[64];
     if (count)
@@ -1147,6 +1439,10 @@ static void disconnect_device(void) {
 
     g_atomic_int_set(&app.connected, 0);
     clear_tabs();
+
+    g_free(app.raw_descriptor);
+    app.raw_descriptor = NULL;
+    app.raw_descriptor_len = 0;
 
     gtk_button_set_label(GTK_BUTTON(app.connect_button), "Connect");
     gtk_widget_set_sensitive(app.device_combo, TRUE);
@@ -1182,7 +1478,7 @@ static void connect_device(void) {
         return;
     }
 
-    /* non-blocking تا hid_read فوراً برگردد */
+    /* non-blocking so hid_read returns immediately */
     hid_set_nonblocking(dev, 1);
 
     unsigned char desc[MAX_DESCRIPTOR_SIZE];
@@ -1195,6 +1491,11 @@ static void connect_device(void) {
         return;
     }
 
+    /* Save raw descriptor copy for Show Descriptor button */
+    g_free(app.raw_descriptor);
+    app.raw_descriptor = g_memdup2(desc, n);
+    app.raw_descriptor_len = n;
+
     g_mutex_lock(&app.hid_mutex);
     app.dev = dev;
     g_mutex_unlock(&app.hid_mutex);
@@ -1202,11 +1503,35 @@ static void connect_device(void) {
 
     build_tabs(desc, n);
 
+    /* --- Update button labels based on each report's size --- */
+    for (int i = 0; i < MAX_REPORT_ID; i++) {
+        ReportBOX *t = app.tabs[i];
+        if (!t) continue;
+        char lbl[64];
+
+        if (t->send_btn) {
+            snprintf(lbl, sizeof(lbl), "Send %u bytes", t->sizes.output_bytes);
+            gtk_button_set_label(GTK_BUTTON(t->send_btn), lbl);
+        }
+        if (t->read_btn) {
+            snprintf(lbl, sizeof(lbl), "Read %u bytes", t->sizes.input_bytes);
+            gtk_button_set_label(GTK_BUTTON(t->read_btn), lbl);
+        }
+        if (t->set_feat_btn) {
+            snprintf(lbl, sizeof(lbl), "Set %u bytes", t->sizes.feature_bytes);
+            gtk_button_set_label(GTK_BUTTON(t->set_feat_btn), lbl);
+        }
+        if (t->get_feat_btn) {
+            snprintf(lbl, sizeof(lbl), "Get %u bytes", t->sizes.feature_bytes);
+            gtk_button_set_label(GTK_BUTTON(t->get_feat_btn), lbl);
+        }
+    }
+
     /*
-     * بررسی می‌کنیم که آیا اصلاً Input Report وجود دارد یا نه.
-     * دستگاه‌هایی که فقط Feature (یا Output) دارند معمولاً
-     * Interrupt IN endpoint ندارند و hid_read روی آن‌ها خطا می‌دهد.
-     * در آن صورت reader thread را اصلاً اجرا نمی‌کنیم.
+     * Check whether an Input Report actually exists.
+     * Devices that only have Feature (or Output) typically
+     * don't have an Interrupt IN endpoint and hid_read will error on them.
+     * In that case we don't run the reader thread at all.
      */
     int has_input = 0;
     for (int i = 0; i < MAX_REPORT_ID; i++) {
@@ -1279,7 +1604,7 @@ static void on_hex_toggled(GtkToggleButton *b, gpointer data) {
     gtk_label_set_text(GTK_LABEL(app.status_label), hex ? "Mode: HEX" : "Mode: ASCII");
 }
 
-/* ---------- auto-connect پس از نمایش پنجره ---------- */
+/* ---------- auto-connect after window is shown ---------- */
 
 static gboolean auto_connect_idle(gpointer data) {
     (void)data;
@@ -1299,7 +1624,7 @@ static void on_window_destroy(GtkWidget *w, gpointer d) {
     if (g_atomic_int_get(&app.shutting_down)) return;
     g_atomic_int_set(&app.shutting_down, 1);
 
-    /* ذخیره تنظیمات پیش از بستن منابع */
+    /* Save settings before closing resources */
     save_config();
 
     stop_reader_thread();
@@ -1317,6 +1642,10 @@ static void on_window_destroy(GtkWidget *w, gpointer d) {
     clear_tabs();
     g_ptr_array_set_size(app.device_paths, 0);
     if (app.device_ids) g_ptr_array_set_size(app.device_ids, 0);
+
+    g_free(app.raw_descriptor);
+    app.raw_descriptor = NULL;
+    app.raw_descriptor_len = 0;
 
     gtk_main_quit();
 }
@@ -1336,6 +1665,8 @@ int main(int argc, char *argv[]) {
     app.device_ids   = g_ptr_array_new_with_free_func(g_free);
     app.tabs_generation = 0;
     app.manual_reads_active = 0;
+    app.raw_descriptor = NULL;
+    app.raw_descriptor_len = 0;
 
     gtk_init(&argc, &argv);
 
@@ -1377,9 +1708,12 @@ int main(int argc, char *argv[]) {
     app.connect_button = GTK_WIDGET(gtk_builder_get_object(builder, "connect_button"));
     app.clear_button   = GTK_WIDGET(gtk_builder_get_object(builder, "clear_button"));
     app.auto_check     = GTK_WIDGET(gtk_builder_get_object(builder, "check_autoconnect"));
+    app.show_descriptor_button =
+                         GTK_WIDGET(gtk_builder_get_object(builder, "show_descriptor_button"));
 
     if (!app.window || !app.device_combo || !app.notebook || !app.status_label ||
-        !app.hex_check || !app.refresh_button || !app.connect_button || !app.clear_button) {
+        !app.hex_check || !app.refresh_button || !app.connect_button ||
+        !app.clear_button || !app.show_descriptor_button) {
         g_printerr("Error: Failed to find required widgets in glade file\n");
         g_object_unref(builder);
         g_ptr_array_free(app.device_paths, TRUE);
@@ -1391,7 +1725,7 @@ int main(int argc, char *argv[]) {
 
 
 	gtk_window_set_title(GTK_WINDOW(app.window), WINTITLE);
-    /* چک‌باکس اتوکانکت در glade بدون برچسب است؛ برچسب را در کد اضافه می‌کنیم */
+    /* The autoconnect checkbox in glade has no label; we add the label in code */
     if (app.auto_check && !gtk_button_get_label(GTK_BUTTON(app.auto_check)))
         gtk_button_set_label(GTK_BUTTON(app.auto_check), "Auto");
 
@@ -1404,21 +1738,23 @@ int main(int argc, char *argv[]) {
     g_signal_connect(app.connect_button , "clicked", G_CALLBACK(on_connect_clicked ), NULL);
     g_signal_connect(app.clear_button   , "clicked", G_CALLBACK(on_clear_clicked   ), NULL);
     g_signal_connect(app.hex_check      , "toggled", G_CALLBACK(on_hex_toggled     ), NULL);
+    g_signal_connect(app.show_descriptor_button, "clicked",
+                     G_CALLBACK(on_show_descriptor), NULL);
     g_signal_connect(app.window         , "destroy", G_CALLBACK(on_window_destroy  ), NULL);
 
-    /* پیش‌فرض اولیه */
+    /* Initial defaults */
     g_atomic_int_set(&app.hex_mode, 0);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.hex_check), FALSE);
 
     g_object_unref(builder);
 
-    /* بازیابی تنظیمات ذخیره‌شده (قبل از populate تا last_device اعمال شود) */
+    /* Restore saved settings (before populate so last_device is applied) */
     load_config();
 
     populate_devices();
     gtk_widget_show_all(app.window);
 
-    /* اتصال خودکار پس از نمایش پنجره */
+    /* Auto-connect after window is shown */
     g_idle_add(auto_connect_idle, NULL);
 
     gtk_main();
@@ -1428,6 +1764,7 @@ int main(int argc, char *argv[]) {
     g_mutex_clear(&app.hid_mutex);
     g_free(cfg_path);
     g_free(pending_last_device);
+    g_free(app.raw_descriptor);
     hid_exit();
     return 0;
 }
