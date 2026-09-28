@@ -1,4 +1,4 @@
-# HID Tool (TARGET)
+# Mia HID Pordo
 
 A GTK3 application for inspecting and communicating with USB HID devices via `hidapi`, with configuration stored through `libconfig`.
 
