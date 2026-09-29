@@ -1,6 +1,6 @@
 ﻿# MiaHIDPordo - GTK3 HID port monitor
 TARGET     := miahidpordo
-VERSION  := 15.1
+VERSION  := 17.0
 TITLE	 := MiaHIDPordo
 ####################################################################################################################
 CFLAGS   += -Wall -Wextra `pkg-config --cflags gtk+-3.0 libconfig` 

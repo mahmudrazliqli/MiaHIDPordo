@@ -23,10 +23,8 @@
 
 #define BITS_TO_BYTES(b) ((unsigned int)(((unsigned long long)(b) + 7ULL) / 8ULL))
 
-//-DTARGET='"any appname"'  makefile
-
 #define CFG_DIR    ".config"
-#define CFG_NAME   TARGET ".cfg" 
+#define CFG_NAME   TARGET ".cfg"
 
 #define RES_GLADE "/org/" TARGET "/window1.glade"
 #define RES_CSS   "/org/" TARGET "/style.css"
@@ -43,8 +41,10 @@ typedef struct {
 } ReportSizes;
 
 typedef struct {
-    GtkWidget *input_view;
-    GtkTextBuffer *input_buf;
+    GtkWidget *input_view;   /* GtkListBox: one GtkLabel row per log line */
+    GtkWidget *log_scroll;   /* GtkScrolledWindow around input_view */
+    int log_rows;            /* rows currently in the list (ring buffer size) */
+    gboolean autoscroll;     /* TRUE while the view is stuck to the bottom */
     GtkWidget *output_entry;
     GtkWidget *feature_entry;
     GtkWidget *send_btn;
@@ -54,17 +54,19 @@ typedef struct {
     unsigned char report_id;
     int has_report_id;
     ReportSizes sizes;
-    int log_lines;
+    GPtrArray *pending;      /* queued log lines, flushed in batches */
+    guint flush_id;          /* GSource id of the pending flush timer */
 } ReportBOX;
 
 typedef struct {
     GtkWidget *notebook, *status_label, *device_combo, *window, *hex_check;
     GtkWidget *connect_button, *refresh_button, *clear_button;
-    GtkWidget *auto_check;                
+    GtkWidget *auto_check;
     GtkWidget *show_descriptor_button;
     GtkWidget *pause_button;
+    GtkWidget *font_spin;
     GPtrArray *device_paths;
-    GPtrArray *device_ids;                 // VID:PID[:Serial]
+    GPtrArray *device_ids;
 
     hid_device *dev;
     GMutex hid_mutex;
@@ -81,6 +83,8 @@ typedef struct {
     gint reader_paused;
     gint shutting_down;
     gint hex_mode;
+
+    gint log_font_size;
 
     gint manual_reads_active;
 
@@ -108,6 +112,49 @@ static void connect_device(void);
 
 static int is_hex_mode(void) {
     return g_atomic_int_get(&app.hex_mode);
+}
+
+/* Global CSS provider for the log views (monospace + size). */
+static GtkCssProvider *log_font_css = NULL;
+
+static void ensure_log_css_provider(void)
+{
+    if (log_font_css) return;
+    log_font_css = gtk_css_provider_new();
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(),
+        GTK_STYLE_PROVIDER(log_font_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+}
+
+/* Tag a list box as "log-view"; actual styling is set once globally. */
+static void apply_font_to_view(GtkWidget *view, int size)
+{
+    (void)size;
+    if (!view || !GTK_IS_LIST_BOX(view)) return;
+    GtkStyleContext *ctx = gtk_widget_get_style_context(view);
+    gtk_style_context_add_class(ctx, "log-view");
+}
+
+/* Update global CSS with new font size and (re)tag all existing views. */
+static void apply_log_font_size(int size)
+{
+    if (size < 6)  size = 6;
+    if (size > 48) size = 48;
+    g_atomic_int_set(&app.log_font_size, size);
+
+    ensure_log_css_provider();
+
+    char *css = g_strdup_printf(
+        "list.log-view { font-family: monospace; font-size: %dpt; }", size);
+    gtk_css_provider_load_from_data(log_font_css, css, -1, NULL);
+    g_free(css);
+
+    for (int i = 0; i < MAX_REPORT_ID; i++) {
+        ReportBOX *t = app.tabs[i];
+        if (t && t->input_view)
+            apply_font_to_view(t->input_view, size);
+    }
 }
 
 static const char *hid_err_str_locked(hid_device *dev) {
@@ -193,64 +240,147 @@ static int parse_input(const char *str, unsigned char *out, int max_len) {
     }
 }
 
-static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
-    if (!tab || !tab->input_buf) return;
-    GtkTextBuffer *buf = tab->input_buf;
+#define LOG_FLUSH_INTERVAL_MS 50
+#define LOG_META_OPEN "<span foreground='#1565C0' size='small'>"
 
-    /* --- Create (or retrieve) metadata tag on this buffer --- */
-    GtkTextTagTable *tags = gtk_text_buffer_get_tag_table(buf);
-    GtkTextTag *tag_meta = gtk_text_tag_table_lookup(tags, "meta");
-    if (!tag_meta) {
-        tag_meta = gtk_text_buffer_create_tag(buf, "meta",
-                                              "foreground", "#1565C0",     /* blue */
-                                              "scale",      PANGO_SCALE_X_SMALL,
-                                              NULL);
-    }
-
-    /* --- Build log line --- */
-    char line[HEX_BUF_SIZE + 256];
-    int len = snprintf(line, sizeof(line), "[%s] %s\n", prefix, text);
-    if (len < 0) len = 0;
-    if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
-
-    /* --- Find boundary between metadata and payload --- */
+/* Build Pango markup for one log line. The part up to "bytes): " (or the
+ * whole line when all_meta / no marker) is blue+small; the payload is plain. */
+static char *make_markup(const char *line, size_t len, gboolean all_meta) {
     static const char *marker = "bytes): ";
-    const char *split = g_strstr_len(line, len, marker);
-    int meta_len = split ? (int)((split - line) + strlen(marker)) : len;
+    const char *split = all_meta ? NULL : g_strstr_len(line, (gssize)len, marker);
+    size_t meta_len = split ? (size_t)(split - line) + strlen(marker) : len;
 
-    GtkTextIter end;
-    gtk_text_buffer_get_end_iter(buf, &end);
+    char *meta = g_markup_escape_text(line, (gssize)meta_len);
+    char *rest = split ? g_markup_escape_text(line + meta_len, (gssize)(len - meta_len))
+                       : g_strdup("");
+    char *out = g_strdup_printf(LOG_META_OPEN "%s</span>%s", meta, rest);
+    g_free(meta);
+    g_free(rest);
+    return out;
+}
 
-    if (split) {
-        /* Metadata with tag, payload without tag */
-        gtk_text_buffer_insert_with_tags(buf, &end, line, meta_len, tag_meta, NULL);
-        gtk_text_buffer_insert(buf, &end, line + meta_len, len - meta_len);
-    } else {
-        /* Entire line is metadata (error message / timeout / ...) */
-        gtk_text_buffer_insert_with_tags(buf, &end, line, len, tag_meta, NULL);
+static void tab_append_row(ReportBOX *tab, const char *markup) {
+    GtkWidget *label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(label), markup);
+    gtk_label_set_selectable(GTK_LABEL(label), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_label_set_line_wrap_mode(GTK_LABEL(label), PANGO_WRAP_WORD_CHAR);
+    gtk_widget_set_margin_start(label, 4);
+    gtk_widget_set_margin_end(label, 4);
+    gtk_widget_show(label);
+    gtk_list_box_insert(GTK_LIST_BOX(tab->input_view), label, -1);
+    tab->log_rows++;
+}
+
+/* Ring buffer: drop the oldest rows beyond MAX_LOG_LINES. */
+static void tab_trim_rows(ReportBOX *tab) {
+    while (tab->log_rows > MAX_LOG_LINES) {
+        GtkListBoxRow *row =
+            gtk_list_box_get_row_at_index(GTK_LIST_BOX(tab->input_view), 0);
+        if (!row) break;
+        gtk_widget_destroy(GTK_WIDGET(row));
+        tab->log_rows--;
     }
+}
 
-    /* --- Remove extra lines --- */
-    tab->log_lines++;
-    while (tab->log_lines > MAX_LOG_LINES) {
-        GtkTextIter start, cut;
-        gtk_text_buffer_get_start_iter(buf, &start);
-        cut = start;
-        if (!gtk_text_iter_forward_line(&cut)) break;
-        gtk_text_buffer_delete(buf, &start, &cut);
-        tab->log_lines--;
+static void tab_clear_rows(ReportBOX *tab) {
+    GtkListBoxRow *row;
+    while ((row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(tab->input_view), 0)))
+        gtk_widget_destroy(GTK_WIDGET(row));
+    tab->log_rows = 0;
+}
+
+/* Auto-scroll: only when the tab is visible (mapped) and stuck to the bottom. */
+static void tab_scroll_to_end(ReportBOX *tab) {
+    if (!tab->log_scroll || !tab->autoscroll) return;
+    if (!gtk_widget_get_mapped(tab->log_scroll)) return;
+    GtkAdjustment *adj =
+        gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(tab->log_scroll));
+    gtk_adjustment_set_value(adj, gtk_adjustment_get_upper(adj) -
+                                  gtk_adjustment_get_page_size(adj));
+}
+
+/* content size changed (rows added/removed) -> follow the end */
+static void on_log_vadj_changed(GtkAdjustment *adj, gpointer data) {
+    (void)adj;
+    tab_scroll_to_end((ReportBOX *)data);
+}
+
+/* user (or we) moved the scrollbar -> remember whether we are at the bottom */
+static void on_log_vadj_value_changed(GtkAdjustment *adj, gpointer data) {
+    ReportBOX *tab = (ReportBOX *)data;
+    double bottom = gtk_adjustment_get_upper(adj) - gtk_adjustment_get_page_size(adj);
+    tab->autoscroll = gtk_adjustment_get_value(adj) >= bottom - 4.0;
+}
+
+/* tab became visible again -> jump to the end if it was following it */
+static void on_log_scroll_map(GtkWidget *w, gpointer data) {
+    (void)w;
+    tab_scroll_to_end((ReportBOX *)data);
+}
+
+/* Write every queued line as a row now. */
+static void tab_flush(ReportBOX *tab) {
+    if (tab->flush_id) {
+        g_source_remove(tab->flush_id);
+        tab->flush_id = 0;
     }
+    if (!tab->input_view || !tab->pending || tab->pending->len == 0) return;
 
-    /* --- Scroll to end --- */
-    gtk_text_buffer_get_end_iter(buf, &end);
-    gtk_text_buffer_place_cursor(buf, &end);
+    /* Only the last MAX_LOG_LINES lines can survive trimming anyway. */
+    guint first = tab->pending->len > (guint)MAX_LOG_LINES
+                ? tab->pending->len - (guint)MAX_LOG_LINES : 0;
 
-    if (tab->input_view) {
-        GtkTextMark *mark = gtk_text_buffer_create_mark(buf, NULL, &end, FALSE);
-        gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(tab->input_view),
-                                     mark, 0.0, FALSE, 0, 0);
-        gtk_text_buffer_delete_mark(buf, mark);
+    for (guint i = first; i < tab->pending->len; i++) {
+        const char *line = g_ptr_array_index(tab->pending, i);
+        size_t n = strlen(line);
+        if (n > 0 && line[n - 1] == '\n') n--;
+        char *markup = make_markup(line, n, FALSE);
+        tab_append_row(tab, markup);
+        g_free(markup);
     }
+    g_ptr_array_set_size(tab->pending, 0);
+
+    tab_trim_rows(tab);
+}
+
+static gboolean flush_tab_cb(gpointer data) {
+    ReportBOX *tab = (ReportBOX *)data;
+    tab->flush_id = 0;          /* this source is removed by the return value */
+    tab_flush(tab);
+    return G_SOURCE_REMOVE;
+}
+
+static void tab_discard_pending(ReportBOX *tab) {
+    if (tab->flush_id) {
+        g_source_remove(tab->flush_id);
+        tab->flush_id = 0;
+    }
+    if (tab->pending) g_ptr_array_set_size(tab->pending, 0);
+}
+
+/* Destroy-notify for the tab: stop the timer, free the queue. */
+static void report_box_free(gpointer data) {
+    ReportBOX *tab = (ReportBOX *)data;
+    if (!tab) return;
+    if (tab->flush_id) g_source_remove(tab->flush_id);
+    if (tab->pending)  g_ptr_array_free(tab->pending, TRUE);
+    g_free(tab);
+}
+
+static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
+    if (!tab || !tab->input_view || !tab->pending) return;
+
+    char *line = g_strdup_printf("[%s] %s\n", prefix, text);
+    /* keep the old size limit on a single line */
+    size_t max = HEX_BUF_SIZE + 255;
+    size_t n = strlen(line);
+    if (n > max) { line[max - 1] = '\n'; line[max] = '\0'; }
+    g_ptr_array_add(tab->pending, line);
+
+    if (!tab->flush_id)
+        tab->flush_id = g_timeout_add(LOG_FLUSH_INTERVAL_MS, flush_tab_cb, tab);
 }
 
 /* ---------- settings (libconfig) ---------- */
@@ -318,6 +448,15 @@ static void load_config(void) {
         pending_last_device = g_strdup(last_dev);
     }
 
+    /* Restore log font size */
+    int fs = 10;
+    if (config_lookup_int(&cfg, "log_font_size", &fs) && app.font_spin) {
+        if (fs < 6)  fs = 6;
+        if (fs > 48) fs = 48;
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(app.font_spin), fs);
+        /* Signal handler will call apply_log_font_size */
+    }
+
     config_destroy(&cfg);
 }
 
@@ -345,6 +484,9 @@ static void save_config(void) {
     s = config_setting_add(root, "window_height", CONFIG_TYPE_INT); config_setting_set_int(s, h);
     s = config_setting_add(root, "window_x",      CONFIG_TYPE_INT); config_setting_set_int(s, x);
     s = config_setting_add(root, "window_y",      CONFIG_TYPE_INT); config_setting_set_int(s, y);
+
+    s = config_setting_add(root, "log_font_size", CONFIG_TYPE_INT);
+    config_setting_set_int(s, g_atomic_int_get(&app.log_font_size));
 
     const char *dev_id = "";
     if (app.device_combo && app.device_ids) {
@@ -469,7 +611,7 @@ static void route_input_data(const unsigned char *buf, int n, int has_report_id,
     }
 }
 
-/* ---------- HID operations on separate thread (Output / Feature Set / Feature Get) ---------- */
+/* ---------- HID operations on separate thread ---------- */
 
 enum {
     OP_OUTPUT,
@@ -482,16 +624,14 @@ typedef struct {
     gint generation;
     int op;
 
-    /* Input */
     unsigned char payload[MAX_REPORT_BYTES];
     int payload_len;
     unsigned char report_id;
     int has_report_id;
-    int read_len;                 /* Only for OP_FEATURE_GET */
+    int read_len;
 
-    /* Output */
-    int status;                   /* 0 = OK, -1 = error */
-    int bytes;                    /* For write: written; for get: read */
+    int status;
+    int bytes;
     unsigned char resp[MAX_READ_BUF];
     char errmsg[256];
 } SyncOp;
@@ -531,7 +671,7 @@ static gboolean sync_op_done(gpointer data) {
             snprintf(msg, sizeof(msg), "SET  (%d bytes): %s", op->payload_len, disp);
         log_to_tab(tab, "FEAT", msg);
 
-    } else { /* OP_FEATURE_GET */
+    } else {
         if (op->status < 0) {
             snprintf(msg, sizeof(msg), "hid_get_feature_report failed: %s", op->errmsg);
         } else if (op->bytes == 0) {
@@ -696,12 +836,7 @@ static gboolean deliver_manual_read(gpointer data) {
     if (!tab || tab != r->tab) return G_SOURCE_REMOVE;
 
     if (r->len > 0) {
-        /* 
-         * hid_get_input_report always returns the Report ID in the first byte,
-         * even when the actual Report ID is zero. So here we set has_rid to 1
-         * so that route_input_data considers the first byte as the Report ID.
-         */
-        route_input_data(r->data, r->len, 1 /* has_report_id */, "READ");
+        route_input_data(r->data, r->len, 1, "READ");
     } else if (r->len == 0) {
         log_to_tab(tab, "READ", "timeout (no data)");
     } else {
@@ -716,7 +851,7 @@ static gpointer manual_read_thread(gpointer data) {
     ManualReadResult *r = (ManualReadResult *)data;
     int waited_ms = 0;
 
-    r->len = 0;   /* Default: timeout */
+    r->len = 0;
 
     while (waited_ms < MANUAL_READ_TIMEOUT_MS) {
         g_mutex_lock(&app.hid_mutex);
@@ -728,12 +863,11 @@ static gpointer manual_read_thread(gpointer data) {
             break;
         }
 
-        /* --- Change: use Control Read instead of hid_read --- */
         unsigned char buf[MAX_READ_BUF];
         memset(buf, 0, sizeof(buf));
-        buf[0] = r->has_rid ? r->rid : 0x00;   /* Report ID in first byte */
+        buf[0] = r->has_rid ? r->rid : 0x00;
 
-        int want = (int)r->tab->sizes.input_bytes + 1;  /* +1 for Report ID */
+        int want = (int)r->tab->sizes.input_bytes + 1;
         if (want > MAX_READ_BUF) want = MAX_READ_BUF;
 
         int n = hid_get_input_report(dev, buf, want);
@@ -907,7 +1041,7 @@ static gboolean on_reader_failed(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
-/* ---------- Reader thread (non-blocking polling) ---------- */
+/* ---------- Reader thread ---------- */
 
 static gpointer reader_thread_func(gpointer data) {
     App *a = (App *)data;
@@ -916,8 +1050,6 @@ static gpointer reader_thread_func(gpointer data) {
 
     while (g_atomic_int_get(&a->reader_running)) {
 
-        /* When paused: don't call hid_read at all so interrupt
-         * reports stay queued in the device and are not consumed. */
         if (g_atomic_int_get(&a->reader_paused)) {
             g_usleep(READER_POLL_SLEEP_US * 10);
             continue;
@@ -930,7 +1062,6 @@ static gpointer reader_thread_func(gpointer data) {
         hid_device *dev = a->dev;
         if (dev && g_atomic_int_get(&a->connected) &&
             g_atomic_int_get(&a->reader_running)) {
-            /* non-blocking read — returns immediately */
             n = hid_read(dev, buf, sizeof(buf));
             if (n < 0)
                 snprintf(errbuf, sizeof(errbuf), "%s", hid_err_str_locked(dev));
@@ -953,7 +1084,6 @@ static gpointer reader_thread_func(gpointer data) {
             }
             break;
         } else {
-            /* n == 0: no data yet, sleep briefly to give others a chance */
             g_usleep(READER_POLL_SLEEP_US);
         }
     }
@@ -1003,15 +1133,58 @@ static void on_pause_clicked(GtkButton *b, gpointer data) {
 
 /* ---------- View construction ---------- */
 
-static GtkWidget *make_terminal_view(GtkWidget **out_view) {
+/* Ctrl+Scroll on the scrolled window changes the font size */
+static gboolean on_view_scroll(GtkWidget *w, GdkEvent *event, gpointer data)
+{
+    (void)w; (void)data;
+
+    if (!event || event->type != GDK_SCROLL) return FALSE;
+    if (!(event->scroll.state & GDK_CONTROL_MASK)) return FALSE;
+    if (!app.font_spin) return FALSE;
+
+    GdkScrollDirection dir = event->scroll.direction;
+    int delta = 0;
+    if (dir == GDK_SCROLL_UP)        delta =  1;
+    else if (dir == GDK_SCROLL_DOWN) delta = -1;
+    else return FALSE;
+
+    GtkAdjustment *adj = gtk_spin_button_get_adjustment(GTK_SPIN_BUTTON(app.font_spin));
+    int cur = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app.font_spin));
+    int lo  = (int)gtk_adjustment_get_lower(adj);
+    int hi  = (int)gtk_adjustment_get_upper(adj);
+    int nv  = cur + delta;
+    if (nv < lo) nv = lo;
+    if (nv > hi) nv = hi;
+    if (nv != cur)
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(app.font_spin), nv);
+    return TRUE;
+}
+
+static GtkWidget *make_terminal_view(ReportBOX *tab) {
     GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
     gtk_widget_set_vexpand(scrolled, TRUE);
-    GtkWidget *view = gtk_text_view_new();
-    gtk_text_view_set_editable(GTK_TEXT_VIEW(view), FALSE);
-    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(view), FALSE);
-    gtk_text_view_set_monospace(GTK_TEXT_VIEW(view), TRUE);
-    gtk_container_add(GTK_CONTAINER(scrolled), view);
-    if (out_view) *out_view = view;
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+
+    GtkWidget *list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(list), GTK_SELECTION_NONE);
+    gtk_list_box_set_activate_on_single_click(GTK_LIST_BOX(list), FALSE);
+    gtk_container_add(GTK_CONTAINER(scrolled), list);
+
+    tab->input_view = list;
+    tab->log_scroll = scrolled;
+    tab->log_rows   = 0;
+    tab->autoscroll = TRUE;
+
+    GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scrolled));
+    g_signal_connect(vadj, "changed",       G_CALLBACK(on_log_vadj_changed),       tab);
+    g_signal_connect(vadj, "value-changed", G_CALLBACK(on_log_vadj_value_changed), tab);
+    g_signal_connect(scrolled, "map",       G_CALLBACK(on_log_scroll_map),         tab);
+
+    /* Ctrl+Scroll intercept */
+    gtk_widget_add_events(scrolled, GDK_SCROLL_MASK);
+    g_signal_connect(scrolled, "scroll-event", G_CALLBACK(on_view_scroll), NULL);
+
     return scrolled;
 }
 
@@ -1036,9 +1209,9 @@ static void clear_tabs(void) {
 static void clear_all_logs(void) {
     for (int i = 0; i < MAX_REPORT_ID; i++) {
         ReportBOX *t = app.tabs[i];
-        if (t && t->input_buf) {
-            gtk_text_buffer_set_text(t->input_buf, "", -1);
-            t->log_lines = 0;
+        if (t && t->input_view) {
+            tab_discard_pending(t);
+            tab_clear_rows(t);
         }
     }
 }
@@ -1050,6 +1223,9 @@ static void build_tabs(const unsigned char *desc, int len)
     int has_id = 0;
     parse_report_descriptor(desc, len, app.main_sizes, &has_id);
     g_atomic_int_set(&app.has_report_id, has_id);
+
+    int current_font = g_atomic_int_get(&app.log_font_size);
+    if (current_font < 6) current_font = 10;
 
     for (int id = 0; id < MAX_REPORT_ID; id++) {
         ReportSizes *hidsizes = &app.main_sizes[id];
@@ -1066,13 +1242,16 @@ static void build_tabs(const unsigned char *desc, int len)
         tab->report_id = id;
         tab->has_report_id = has_id ? 1 : 0;
         tab->sizes = *hidsizes;
-        tab->log_lines = 0;
+        tab->pending = g_ptr_array_new_with_free_func(g_free);
 
         GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
         gtk_container_set_border_width(GTK_CONTAINER(vbox), 6);
 
-        GtkWidget *scrolled = make_terminal_view(&tab->input_view);
-        tab->input_buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tab->input_view));
+        GtkWidget *scrolled = make_terminal_view(tab);
+
+        /* Apply current font size to the new view immediately */
+        apply_font_to_view(tab->input_view, current_font);
+
         gtk_box_pack_start(GTK_BOX(vbox), scrolled, TRUE, TRUE, 0);
 
         const char *ph = is_hex_mode() ? "hex bytes e.g. 01 02 FF" : "text e.g. Hello";
@@ -1125,7 +1304,7 @@ static void build_tabs(const unsigned char *desc, int len)
         gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(vbox), hbox2, FALSE, FALSE, 0);
 
-        g_object_set_data_full(G_OBJECT(vbox), "report_box", tab, g_free);
+        g_object_set_data_full(G_OBJECT(vbox), "report_box", tab, report_box_free);
         gtk_notebook_append_page(GTK_NOTEBOOK(app.notebook),
                                  vbox, gtk_label_new(tab_title));
         gtk_widget_show_all(vbox);
@@ -1166,7 +1345,7 @@ static const char *usage_page_name(unsigned int page) {
 }
 
 static const char *usage_name(unsigned int page, unsigned int usage) {
-    if (page == 0x01) {                    /* Generic Desktop */
+    if (page == 0x01) {
         switch (usage) {
             case 0x00: return "Undefined";
             case 0x01: return "Pointer";
@@ -1191,7 +1370,6 @@ static const char *usage_name(unsigned int page, unsigned int usage) {
     return NULL;
 }
 
-/* Output: multiline GString with hex + comments */
 static GString *format_descriptor(const unsigned char *desc, int len) {
     GString *out = g_string_new(NULL);
     int i = 0;
@@ -1202,7 +1380,6 @@ static GString *format_descriptor(const unsigned char *desc, int len) {
         int start = i;
         unsigned char prefix = desc[i++];
 
-        /* Long item (0xFE) — rare */
         if (prefix == 0xFE) {
             if (i + 1 >= len) break;
             int dlen = desc[i];
@@ -1220,20 +1397,18 @@ static GString *format_descriptor(const unsigned char *desc, int len) {
         for (int b = 0; b < data_size && i < len; b++)
             data |= ((unsigned int)desc[i++]) << (8 * b);
 
-        /* Hex part */
         GString *hex = g_string_new(NULL);
         for (int k = start; k < i; k++)
             g_string_append_printf(hex, "0x%02x, ", desc[k]);
         while (hex->len < 26) g_string_append_c(hex, ' ');
 
-        /* Indentation based on collection depth */
         GString *indent = g_string_new(NULL);
         for (int d = 0; d < depth + 1; d++) g_string_append(indent, "    ");
 
         const char *item_name = "?";
         char extra[160] = {0};
 
-        if (type == 0) {                    /* Main */
+        if (type == 0) {
             switch (tag) {
                 case 0x8: item_name = "INPUT";           break;
                 case 0x9: item_name = "OUTPUT";          break;
@@ -1256,7 +1431,7 @@ static GString *format_descriptor(const unsigned char *desc, int len) {
                 case 0xC: item_name = "END_COLLECTION";  break;
                 default:  item_name = "MAIN";            break;
             }
-        } else if (type == 1) {             /* Global */
+        } else if (type == 1) {
             switch (tag) {
                 case 0x0: {
                     item_name = "USAGE_PAGE";
@@ -1280,7 +1455,7 @@ static GString *format_descriptor(const unsigned char *desc, int len) {
                 case 0xB: item_name = "POP";              break;
                 default:  item_name = "GLOBAL";           break;
             }
-        } else if (type == 2) {             /* Local */
+        } else if (type == 2) {
             switch (tag) {
                 case 0x0: {
                     item_name = "USAGE";
@@ -1303,7 +1478,6 @@ static GString *format_descriptor(const unsigned char *desc, int len) {
             item_name = "RESERVED";
         }
 
-        /* END_COLLECTION is printed one level back */
         if (type == 0 && tag == 0xC && depth > 0) {
             depth--;
             g_string_set_size(indent, 0);
@@ -1315,7 +1489,6 @@ static GString *format_descriptor(const unsigned char *desc, int len) {
         if (extra[0]) g_string_append_printf(out, " (%s)", extra);
         g_string_append_c(out, '\n');
 
-        /* COLLECTION goes one level forward */
         if (type == 0 && tag == 0xA) depth++;
 
         g_string_free(hex,    TRUE);
@@ -1324,59 +1497,35 @@ static GString *format_descriptor(const unsigned char *desc, int len) {
     return out;
 }
 
-/* Multiline log: like log_to_tab but inserts the whole text at once. */
 static void log_multiline_to_tab(ReportBOX *tab, const char *text) {
-    if (!tab || !tab->input_buf || !text) return;
-    GtkTextBuffer *buf = tab->input_buf;
+    if (!tab || !tab->input_view || !text) return;
 
-    GtkTextTagTable *tags = gtk_text_buffer_get_tag_table(buf);
-    GtkTextTag *tag_meta = gtk_text_tag_table_lookup(tags, "meta");
-    if (!tag_meta) {
-        tag_meta = gtk_text_buffer_create_tag(buf, "meta",
-                                              "foreground", "#1565C0",
-                                              "scale",      PANGO_SCALE_X_SMALL,
-                                              NULL);
-    }
+    tab_flush(tab);   /* keep ordering with queued lines */
 
-    GtkTextIter end;
-    gtk_text_buffer_get_end_iter(buf, &end);
-    gtk_text_buffer_insert_with_tags(buf, &end, text, -1, tag_meta, NULL);
+    size_t n = strlen(text);
+    while (n > 0 && (text[n - 1] == '\n' || text[n - 1] == '\r')) n--;
+    if (n == 0) return;
 
-    int added = 1;
-    for (const char *p = text; *p; p++) if (*p == '\n') added++;
-    tab->log_lines += added;
+    char *escaped = g_markup_escape_text(text, (gssize)n);
+    char *markup = g_strdup_printf("<span foreground='#c62872'>%s</span>", escaped);
+    g_free(escaped);
 
-    while (tab->log_lines > MAX_LOG_LINES) {
-        GtkTextIter start, cut;
-        gtk_text_buffer_get_start_iter(buf, &start);
-        cut = start;
-        if (!gtk_text_iter_forward_line(&cut)) break;
-        gtk_text_buffer_delete(buf, &start, &cut);
-        tab->log_lines--;
-    }
+    tab_append_row(tab, markup);          /* whole descriptor = one row */
+    g_free(markup);
 
-    gtk_text_buffer_get_end_iter(buf, &end);
-    gtk_text_buffer_place_cursor(buf, &end);
-
-    if (tab->input_view) {
-        GtkTextMark *mark = gtk_text_buffer_create_mark(buf, NULL, &end, FALSE);
-        gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(tab->input_view),
-                                     mark, 0.0, FALSE, 0, 0);
-        gtk_text_buffer_delete_mark(buf, mark);
-    }
+    tab_trim_rows(tab);
 }
-
 /* ---------- Show Report Descriptor ---------- */
 
 static void on_show_descriptor(GtkButton *b, gpointer data) {
     (void)b; (void)data;
-	clear_all_logs();
+    clear_all_logs();
     if (!app.raw_descriptor || app.raw_descriptor_len <= 0) {
-        gtk_label_set_text(GTK_LABEL(app.status_label),"No descriptor available (connect first)");
+        gtk_label_set_text(GTK_LABEL(app.status_label),
+                           "No descriptor available (connect first)");
         return;
     }
 
-    /* ReportBOX of current tab */
     ReportBOX *tab = NULL;
     if (app.notebook) {
         int page = gtk_notebook_get_current_page(GTK_NOTEBOOK(app.notebook));
@@ -1430,7 +1579,6 @@ static void populate_devices(void) {
         snprintf(label, sizeof(label), "%04x:%04x  %s %s",
                  cur->vendor_id, cur->product_id, mfg, prod);
 
-        /* Stable identifier for restoration between runs */
         char dev_id[256];
         if (cur->serial_number && *cur->serial_number) {
             char ser[160];
@@ -1454,7 +1602,7 @@ static void populate_devices(void) {
     gtk_combo_box_set_model(GTK_COMBO_BOX(app.device_combo), GTK_TREE_MODEL(store));
     g_object_unref(store);
 
-    apply_pending_device();   /* Instead of set_active(0): restores previous selection */
+    apply_pending_device();
 
     char msg[64];
     if (count)
@@ -1498,7 +1646,6 @@ static void disconnect_device(void) {
     gtk_label_set_text(GTK_LABEL(app.status_label), "Disconnected");
 }
 
-
 static void connect_device(void) {
     int sel = gtk_combo_box_get_active(GTK_COMBO_BOX(app.device_combo));
     if (sel < 0 || sel >= (int)app.device_paths->len) {
@@ -1523,20 +1670,22 @@ static void connect_device(void) {
         return;
     }
 
-    /* non-blocking so hid_read returns immediately */
     hid_set_nonblocking(dev, 1);
 
     unsigned char desc[MAX_DESCRIPTOR_SIZE];
     int n = hid_get_report_descriptor(dev, desc, sizeof(desc));
     if (n <= 0) {
         hid_close(dev);
+        /* Clear any stale descriptor from a previous connection. */
+        g_free(app.raw_descriptor);
+        app.raw_descriptor = NULL;
+        app.raw_descriptor_len = 0;
         gtk_label_set_text(GTK_LABEL(app.status_label),
                            n == 0 ? "Empty Report Descriptor"
                                   : "Failed to read Report Descriptor");
         return;
     }
 
-    /* Save raw descriptor copy for Show Descriptor button */
     g_free(app.raw_descriptor);
     app.raw_descriptor = g_memdup2(desc, n);
     app.raw_descriptor_len = n;
@@ -1546,13 +1695,11 @@ static void connect_device(void) {
     g_mutex_unlock(&app.hid_mutex);
     g_atomic_int_set(&app.connected, 1);
 
-    /* Reset pause state and refresh icon on (re)connect */
     g_atomic_int_set(&app.reader_paused, 0);
     update_pause_button();
 
     build_tabs(desc, n);
 
-    /* --- Update button labels based on each report's size --- */
     for (int i = 0; i < MAX_REPORT_ID; i++) {
         ReportBOX *t = app.tabs[i];
         if (!t) continue;
@@ -1576,12 +1723,6 @@ static void connect_device(void) {
         }
     }
 
-    /*
-     * Check whether an Input Report actually exists.
-     * Devices that only have Feature (or Output) typically
-     * don't have an Interrupt IN endpoint and hid_read will error on them.
-     * In that case we don't run the reader thread at all.
-     */
     int has_input = 0;
     for (int i = 0; i < MAX_REPORT_ID; i++) {
         if (app.main_sizes[i].input_bytes > 0) { has_input = 1; break; }
@@ -1653,6 +1794,14 @@ static void on_hex_toggled(GtkToggleButton *b, gpointer data) {
     gtk_label_set_text(GTK_LABEL(app.status_label), hex ? "Mode: HEX" : "Mode: ASCII");
 }
 
+/* ---------- font size spin ---------- */
+
+static void on_font_size_changed(GtkSpinButton *spin, gpointer data)
+{
+    (void)data;
+    apply_log_font_size(gtk_spin_button_get_value_as_int(spin));
+}
+
 /* ---------- auto-connect after window is shown ---------- */
 
 static gboolean auto_connect_idle(gpointer data) {
@@ -1673,7 +1822,6 @@ static void on_window_destroy(GtkWidget *w, gpointer d) {
     if (g_atomic_int_get(&app.shutting_down)) return;
     g_atomic_int_set(&app.shutting_down, 1);
 
-    /* Save settings before closing resources */
     save_config();
 
     stop_reader_thread();
@@ -1716,20 +1864,16 @@ int main(int argc, char *argv[]) {
     app.manual_reads_active = 0;
     app.raw_descriptor = NULL;
     app.raw_descriptor_len = 0;
+    app.log_font_size = 10;   /* overridden from spin button below */
 
     gtk_init(&argc, &argv);
 
-
-
-    /* Load UI + CSS from GResource.
-     * These resources are compiled from resources/resources.gresource.xml
-     * (registered automatically via the constructor emitted by
-     *  glib-compile-resources --generate-source). */
     GError *err = NULL;
     GtkBuilder *builder = gtk_builder_new();
-	gboolean loaded = gtk_builder_add_from_resource(builder, RES_GLADE, &err);
+    gboolean loaded = gtk_builder_add_from_resource(builder, RES_GLADE, &err);
     if (!loaded) {
-		g_printerr("Failed to load %s: %s\n",RES_GLADE, err ? err->message : "unknown error");
+        g_printerr("Failed to load %s: %s\n", RES_GLADE,
+                   err ? err->message : "unknown error");
         if (err) g_error_free(err);
         g_object_unref(builder);
         g_ptr_array_free(app.device_paths, TRUE);
@@ -1739,9 +1883,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Apply stylesheet from the same resource bundle. */
     GtkCssProvider *css = gtk_css_provider_new();
-    gtk_css_provider_load_from_resource(css,RES_CSS);
+    gtk_css_provider_load_from_resource(css, RES_CSS);
     gtk_style_context_add_provider_for_screen(
         gdk_screen_get_default(),
         GTK_STYLE_PROVIDER(css),
@@ -1760,10 +1903,12 @@ int main(int argc, char *argv[]) {
     app.show_descriptor_button =
                          GTK_WIDGET(gtk_builder_get_object(builder, "show_descriptor_button"));
     app.pause_button   = GTK_WIDGET(gtk_builder_get_object(builder, "pause_button"));
+    app.font_spin      = GTK_WIDGET(gtk_builder_get_object(builder, "font_size_spin"));
 
     if (!app.window || !app.device_combo || !app.notebook || !app.status_label ||
         !app.hex_check || !app.refresh_button || !app.connect_button ||
-        !app.clear_button || !app.show_descriptor_button || !app.pause_button) {
+        !app.clear_button || !app.show_descriptor_button || !app.pause_button ||
+        !app.font_spin) {
         g_printerr("Error: Failed to find required widgets in glade file\n");
         g_object_unref(builder);
         g_ptr_array_free(app.device_paths, TRUE);
@@ -1773,16 +1918,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-
-	gtk_window_set_title(GTK_WINDOW(app.window), WINTITLE);
-    /* The autoconnect checkbox in glade has no label; we add the label in code */
+    gtk_window_set_title(GTK_WINDOW(app.window), WINTITLE);
     if (app.auto_check && !gtk_button_get_label(GTK_BUTTON(app.auto_check)))
         gtk_button_set_label(GTK_BUTTON(app.auto_check), "Auto");
 
     GtkCellRenderer *rend = gtk_cell_renderer_text_new();
     gtk_cell_layout_pack_start(GTK_CELL_LAYOUT(app.device_combo), rend, TRUE);
     gtk_cell_layout_set_attributes(GTK_CELL_LAYOUT(app.device_combo), rend, "text", 0, NULL);
-    
 
     g_signal_connect(app.refresh_button , "clicked", G_CALLBACK(on_refresh_clicked ), NULL);
     g_signal_connect(app.connect_button , "clicked", G_CALLBACK(on_connect_clicked ), NULL);
@@ -1791,6 +1933,8 @@ int main(int argc, char *argv[]) {
     g_signal_connect(app.show_descriptor_button, "clicked", G_CALLBACK(on_show_descriptor), NULL);
     g_signal_connect(app.pause_button   , "clicked", G_CALLBACK(on_pause_clicked   ), NULL);
     g_signal_connect(app.window         , "destroy", G_CALLBACK(on_window_destroy  ), NULL);
+    g_signal_connect(app.font_spin      , "value-changed",
+                     G_CALLBACK(on_font_size_changed), NULL);
 
     /* Initial defaults */
     g_atomic_int_set(&app.hex_mode, 0);
@@ -1798,15 +1942,16 @@ int main(int argc, char *argv[]) {
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.hex_check), FALSE);
     update_pause_button();
 
+    /* Apply initial font size (value comes from the spin button in glade). */
+    apply_log_font_size(gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app.font_spin)));
+
     g_object_unref(builder);
 
-    /* Restore saved settings (before populate so last_device is applied) */
     load_config();
 
     populate_devices();
     gtk_widget_show_all(app.window);
 
-    /* Auto-connect after window is shown */
     g_idle_add(auto_connect_idle, NULL);
 
     gtk_main();
@@ -1817,6 +1962,7 @@ int main(int argc, char *argv[]) {
     g_free(cfg_path);
     g_free(pending_last_device);
     g_free(app.raw_descriptor);
+    if (log_font_css) g_object_unref(log_font_css);
     hid_exit();
     return 0;
 }
