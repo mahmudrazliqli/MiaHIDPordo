@@ -1,8 +1,9 @@
 ﻿TARGET     	:= miahidpordo
 VERSION  	:= 17.1
 TITLE	 	:= MiaHIDPordo
-DESCRIPTION :=$(TITLE) - GTK3 HID device monitor and terminal \n \
-$(TITLE) supports output, input and feature.
+AUTOR		:=Mahmudrazliqli <mahmudrazliqli@yahoo.com>
+SECTION		:=electronics
+DESCRIPTION :=$(TITLE) -HID device terminal , supports output, input and feature.
 ####################################################################################################################
 CFLAGS   += -Wall -Wextra `pkg-config --cflags gtk+-3.0 libconfig` 
 CFLAGS   += -DWINTITLE='"$(TITLE) $(VERSION)"' -DTARGET='"$(TARGET)"'
@@ -79,15 +80,11 @@ deb:all
 	@install -m 0644 debian/$(TARGET).svg $(STAGE)$(PREFIX)/share/icons/hicolor/scalable/apps/$(TARGET).svg
 	@install -m 0644 debian/copyright $(STAGE)$(PREFIX)/share/doc/$(TARGET)/copyright
 	@DEPS=$$(dpkg-shlibdeps -O $(TARGET) 2>/dev/null | sed -n 's/^shlibs:Depends=//p'); \
-	sed \
-	-e 's/@PACKAGENAME@/$(TARGET)/g' \
-	-e 's/@VERSION@/$(VERSION)/g' \
-	-e 's/@DESCRIPTION@/$(DESCRIPTION)/g' \
-	-e 's/@ARCH@/$(DEBARCH)/g' \
-	-e "s|@DEPS@|$$DEPS|g" \
+	sed -e 's/@PACKAGENAME@/$(TARGET)/g' -e 's/@VERSION@/$(VERSION)/g' -e 's/@DESCRIPTION@/$(DESCRIPTION)/g' -e 's/@AUTOR@/$(AUTOR)/g' \
+	-e 's/@SECTION@/$(SECTION)/g' -e 's/@ARCH@/$(DEBARCH)/g' -e "s|@DEPS@|$$DEPS|g" \
 	debian/control.in > $(STAGE)/DEBIAN/control
 	@dpkg-deb --root-owner-group --build $(STAGE) $(DEBFILE)
-	@rm -rf .deb
+	#@rm -rf .deb
 	@echo "############### $(DEBFILE) IS READY ###################"
   else
 	@echo "deb: not a Debian-based system" >&2
