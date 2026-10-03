@@ -103,7 +103,7 @@ program:all
 	rm -f windows/nsis/uninst.exe
 	cd windows/nsis && makensis installer.nsi
 	mv windows/nsis/$(TARGET)_Setup.exe ./$(TITLE)_$(VERSION)_Setup.exe
-	@rm -f windows/nsis/*.ico windows/nsis/*.exe windows/nsis/*.dll .deb
+	@rm -f windows/nsis/*.ico windows/nsis/*.exe windows/nsis/*.dll .deb windows/nsis/installer.nsi
 	@echo "#############   $(TITLE)_$(VERSION)_Setup.exe  IS READY  ####################"
 endif
 #pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-gtk3 mingw-w64-x86_64-libconfig mingw-w64-x86_64-nsis p7zip
