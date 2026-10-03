@@ -1,8 +1,8 @@
 Package: @PACKAGENAME@
 Version: @VERSION@
-Section: electronics
+Section: @SECTION@
 Priority: optional
 Architecture: @ARCH@
 Depends: @DEPS@
-Maintainer: Bir <bir@localhost>
+Maintainer: @AUTOR@
 Description:@DESCRIPTION@

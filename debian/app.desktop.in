@@ -9,4 +9,4 @@ Terminal=false
 Categories=Development;Electronics;
 Keywords=usb;hid;terminal;
 StartupNotify=true
-Name[en_US]=$(TARGET).desktop
+Name[en_US]=@TITLE@
