@@ -13,7 +13,7 @@ else ifeq ($(shell uname -s), Linux)
 LDLIBS   += -lhidapi-libusb
 endif
 ####################################################################################################################
-all:clean info
+all:clean info gresource
 	gcc	-c main.c		-o main.o		$(CFLAGS)
 	gcc	-c resources.c	-o resources.o	$(CFLAGS)
 	gcc	*.o -o $(TARGET) $(LDLIBS)
@@ -25,19 +25,34 @@ run:all
 info: $(RES_SRC)
 	@echo + OS = $(OS) 
 	@echo - shell uname= $(shell uname -s)	
-	@echo -  GResource :
-	glib-compile-resources resources/resources.gresource.xml --sourcedir=resources --generate-source --target=resources.c --c-name=$(TARGET)
+	cp resources/icon.svg debian/$(TARGET).svg
 ifeq ($(OS), Windows_NT)
+	rsvg-convert -w 256 -h 256 resources/icon.svg -o /tmp/icon.png && icotool -c -o windows/Application/Application.ico /tmp/icon.png && rm -f /tmp/icon.png
 	windres -I. -i windows/application/resource.rc -o winresource.o
 endif
 ####################################################################################################################
-
-	
+gresource:
+	rm -f resources/resources.gresource.xml
+	@mkdir -p resources
+	@printf '%s\n' \
+	  '<?xml version="1.0" encoding="UTF-8"?>' \
+	  '<gresources>' \
+	  '  <gresource prefix="/org/$(TARGET)">' \
+	  '    <file>window1.glade</file>' \
+	  '    <file>style.css</file>' \
+	  '  </gresource>' \
+	  '</gresources>' \
+	  > resources/resources.gresource.xml
+	@echo "Generated resources/resources.gresource.xml"
+	@echo -  GResource :
+	glib-compile-resources resources/resources.gresource.xml --sourcedir=resources --generate-source --target=resources.c --c-name=$(TARGET)
+####################################################################################################################
 clean:
 	rm -rf main *.o  *.exe $(TARGET)  
 	@rm -rf resources.c
 	@rm -rf windows/nsis/*.ico windows/nsis/*.exe windows/nsis/*.dll  windows/nsis/*.glade 
 	@rm -rf $(TARGET) *.o main .deb *.deb
+	@rm -f resources/resources.gresource.xml
 ####################################################################################################################
 ifeq ($(shell uname -s),Linux)
   ifneq ($(wildcard /etc/debian_version),)
@@ -62,7 +77,7 @@ deb:all
 	@exit 1
   endif
 endif
-#sudo apt install libhidapi-dev 
+#sudo apt install libhidapi-dev librsvg2-bin icoutils
 ####################################################################################################################
 ifeq ($(OS), Windows_NT)	
 program:all
@@ -77,4 +92,5 @@ program:all
 	@echo "#############   $(TITLE)_$(VERSION)_Setup.exe  IS READY  ####################"
 endif
 #pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-gtk3 mingw-w64-x86_64-libconfig mingw-w64-x86_64-nsis p7zip
+#pacman -S mingw-w64x86_64-librsvg mingw-w64x86_64-icoutils
 ####################################################################################################################
