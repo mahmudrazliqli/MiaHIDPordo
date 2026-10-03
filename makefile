@@ -1,5 +1,5 @@
 ﻿TARGET     	:= miahidpordo
-VERSION  	:= 17.1
+VERSION  	:= 17.2
 TITLE	 	:= MiaHIDPordo
 AUTOR		:=Mahmudrazliqli <mahmudrazliqli@yahoo.com>
 SECTION		:=electronics
@@ -93,14 +93,67 @@ deb:all
 endif
 #sudo apt install libhidapi-dev librsvg2-bin icoutils
 ####################################################################################################################
-ifeq ($(OS), Windows_NT)	
+ifeq ($(OS), Windows_NT)
 program:all
 	@echo "######################   WINDOWS SETUP   ##########################"
+	
+	rm -f windows/nsis/*.dll
+	cp C:/msys64/mingw64/bin/libconfig-15.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libgdk-3-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libcairo-gobject-2.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libcairo-2.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libgcc_s_seh-1.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libwinpthread-1.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libstdc++-6.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libfontconfig-1.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libexpat-1.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libfreetype-6.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libbrotlidec.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libbrotlicommon.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libbz2-1.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libharfbuzz-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libgraphite2.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libpixman-1-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libpng16-16.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/zlib1.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libepoxy-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libfribidi-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libgdk_pixbuf-2.0-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libgmodule-2.0-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libjpeg-8.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libtiff-6.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libdeflate.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libjbig-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libLerc.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/liblzma-5.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libwebp-7.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libsharpyuv-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libzstd.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libintl-8.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libiconv-2.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libpango-1.0-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libthai-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libdatrie-1.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libpangocairo-1.0-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libpangoft2-1.0-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libpangowin32-1.0-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libgio-2.0-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libglib-2.0-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libpcre2-8-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libgobject-2.0-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libffi-8.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libgtk-3-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libatk-1.0-0.dll windows/nsis/
+	cp C:/msys64/mingw64/bin/libhidapi-0.dll windows/nsis/ 
+	#7z x windows/nsis/dlls.7z -owindows/nsis -y;
+	@echo "######################   nsis/installer.nsi  ##########################"
 	sed -e 's|@APP_VERSION@|$(VERSION)|g' -e 's|@APP_NAME@|$(TITLE)|g' windows/nsis/installer.nsi.in > windows/nsis/installer.nsi
+	@echo "######################   nsis/$(TARGET).ico  ##########################"
 	cp windows/Application/application.ico  windows/nsis/$(TARGET).ico
+	@echo "######################   nsis/$(TARGET)  ##########################"
 	cp $(TARGET) windows/nsis/$(TARGET)
-	7z x windows/nsis/dlls.7z -owindows/nsis -y;
 	rm -f windows/nsis/uninst.exe
+	@echo "######################   Nsis  ##########################"
 	cd windows/nsis && makensis installer.nsi
 	mv windows/nsis/$(TARGET)_Setup.exe ./$(TITLE)_$(VERSION)_Setup.exe
 	@rm -f windows/nsis/*.ico windows/nsis/*.exe windows/nsis/*.dll .deb windows/nsis/installer.nsi
