@@ -84,7 +84,7 @@ deb:all
 	-e 's/@SECTION@/$(SECTION)/g' -e 's/@ARCH@/$(DEBARCH)/g' -e "s|@DEPS@|$$DEPS|g" \
 	debian/control.in > $(STAGE)/DEBIAN/control
 	@dpkg-deb --root-owner-group --build $(STAGE) $(DEBFILE)
-	#@rm -rf .deb
+	@rm -rf .deb
 	@echo "############### $(DEBFILE) IS READY ###################"
   else
 	@echo "deb: not a Debian-based system" >&2
