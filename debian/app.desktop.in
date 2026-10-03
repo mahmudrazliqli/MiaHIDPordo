@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=@TITLE@
+GenericName=@TITLE@
+Comment=@DESCRIPTION@
+Exec=@PACKAGENAME@
+Icon=@PACKAGENAME@
+Terminal=false
+Categories=Development;Electronics;
+Keywords=usb;hid;terminal;
+StartupNotify=true
+Name[en_US]=$(TARGET).desktop
