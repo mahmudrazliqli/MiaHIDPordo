@@ -1,5 +1,5 @@
 ﻿TARGET     	:= miahidpordo
-VERSION  	:= 17.2
+VERSION  	:= 17.3
 TITLE	 	:= MiaHIDPordo
 AUTOR		:=Mahmudrazliqli <mahmudrazliqli@yahoo.com>
 SECTION		:=electronics
@@ -16,27 +16,52 @@ LDLIBS   += -lhidapi-libusb
 endif
 ####################################################################################################################
 all:clean info gresource
-	gcc	-c main.c		-o main.o		$(CFLAGS)
+	@echo
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@echo "+        Compiling files          +"
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@echo "- main.c --> main.o"
+	gcc	-c main.c -o main.o $(CFLAGS)
+	@echo "- resources.c --> resources.o"
 	gcc	-c resources.c	-o resources.o	$(CFLAGS)
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@echo "+     Linking *.o and  LDLIBS     +"
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@echo "- *.o + LDLIBS --> $(TARGET)"
 	gcc	*.o -o $(TARGET) $(LDLIBS)
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@echo "+        $(TARGET) is ready     +"
+	@echo "+++++++++++++++++++++++++++++++++++"
 	@rm -rf main *.o resources.c
 	
 run:all
 	./$(TARGET)
 ####################################################################################################################
 info: $(RES_SRC)
-	@echo + OS = $(OS) 
-	@echo - shell uname= $(shell uname -s)	
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@echo "+ shell uname= $(shell uname -s) +"
+	@echo "+++++++++++++++++++++++++++++++++++"
 ifeq ($(OS), Windows_NT)
+	@echo "+ ******* OS = $(OS) ******* +"
+	@echo "- resources/icon.svg --> resources/icon.png  "
 	rsvg-convert -w 256 -h 256 resources/icon.svg -o 	resources/icon.png
-	icotool -c -o windows/Application/Application.ico 	resources/icon.png
-	sed -e 's|@APP_VERSION@|$(VERSION)|g' -e 's|@APP_NAME@|$(TARGET)|g' windows/application/Application.manifest.in > windows/application/Application.manifest
-	sed -e 's|@APP_VERSION@|$(VERSION)|g' -e 's|@APP_NAME@|$(TARGET)|g' windows/application/resource.rc.in > windows/application/resource.rc
-	windres -I. -Iwindows/application -i windows/application/resource.rc -o winresource.o
+	@echo "-  resources/icon.png --> windows/Application.ico  "
+	icotool -c -o windows/Application.ico 	resources/icon.png
+	@echo "- windows/Application.manifest.in --> windows/Application.manifest  "
+	sed -e 's|@APP_VERSION@|$(VERSION)|g' -e 's|@APP_NAME@|$(TARGET)|g' windows/Application.manifest.in > windows/Application.manifest
+	@echo "- windows/resource.rc.in --> windows/resource.rc  "
+	sed -e 's|@APP_VERSION@|$(VERSION)|g' -e 's|@APP_NAME@|$(TARGET)|g' windows/resource.rc.in > windows/resource.rc
+	@echo "- windows/resource.rc --> winresource.o  "
+	windres -I. -Iwindows -i windows/resource.rc -o winresource.o
+	@rm -rf windows/resource.rc windows/Application.manifest
 endif
 ####################################################################################################################
 gresource:
-	rm -f resources/resources.gresource.xml
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@echo "+        gresource files          +"
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@rm -rf resources/resources.gresource.xml
+	@echo "- writing resources/resources.gresource.xml  "
 	@mkdir -p resources
 	@printf '%s\n' \
 	  '<?xml version="1.0" encoding="UTF-8"?>' \
@@ -47,16 +72,19 @@ gresource:
 	  '  </gresource>' \
 	  '</gresources>' \
 	  > resources/resources.gresource.xml
-	@echo "Generated resources/resources.gresource.xml"
-	@echo -  GResource :
+	@echo "echo --> resources/resources.gresource.xml"
+	@echo "- resources.gresource.xml --> resources.c"
 	glib-compile-resources resources/resources.gresource.xml --sourcedir=resources --generate-source --target=resources.c --c-name=$(TARGET)
 ####################################################################################################################
 clean:
-	rm -rf main *.o  *.exe $(TARGET)
-	rm -rf resources.c resources/resources.gresource.xml  resources/icon.png
-	rm -rf windows/nsis/installer.nsi windows/nsis/*.ico windows/nsis/*.exe windows/nsis/*.dll  windows/nsis/*.glade 
-	rm -rf windows/Application/Application.manifest windows/Application/resource.rc windows/Application/Application.ico
-	rm -rf  .deb *.deb debian/$(TARGET).desktop debian/copyright debian/$(TARGET).svg
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@echo "+        Cleaning ...             +"
+	@rm -rf main *.o  *.exe $(TARGET)
+	@rm -rf resources.c resources/resources.gresource.xml  resources/icon.png
+	@rm -rf windows/installer.nsi windows/*.ico windows/*.exe windows/*.dll  windows/*.glade 
+	@rm -rf windows/Application.manifest windows/resource.rc windows/Application.ico
+	@rm -rf  debian/.deb *.deb debian/$(TARGET).desktop debian/copyright debian/$(TARGET).svg
+	@echo "+++++++++++++++++++++++++++++++++++"
 ####################################################################################################################
 ifeq ($(shell uname -s),Linux)
   ifneq ($(wildcard /etc/debian_version),)
@@ -64,7 +92,7 @@ program: deb
 
 PREFIX   := /usr
 DEBARCH  := $(shell dpkg --print-architecture 2>/dev/null || echo amd64)
-STAGE    := .deb/$(TARGET)-$(VERSION)
+STAGE    := debian/.deb/$(TARGET)-$(VERSION)
 DEBFILE  := $(TARGET)_$(VERSION)_$(DEBARCH).deb
 deb:all	
 	cp resources/icon.svg debian/$(TARGET).svg
@@ -84,7 +112,7 @@ deb:all
 	-e 's/@SECTION@/$(SECTION)/g' -e 's/@ARCH@/$(DEBARCH)/g' -e "s|@DEPS@|$$DEPS|g" \
 	debian/control.in > $(STAGE)/DEBIAN/control
 	@dpkg-deb --root-owner-group --build $(STAGE) $(DEBFILE)
-	@rm -rf .deb
+	@rm -rf debian/.deb debian/copyright debian/$(TARGET).desktop debian/$(TARGET).svg
 	@echo "############### $(DEBFILE) IS READY ###################"
   else
 	@echo "deb: not a Debian-based system" >&2
@@ -94,28 +122,30 @@ endif
 #sudo apt install libhidapi-dev librsvg2-bin icoutils
 ####################################################################################################################
 ifeq ($(OS), Windows_NT)
+#pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-gtk3 mingw-w64-x86_64-libconfig mingw-w64-x86_64-nsis p7zip mingw-w64-x86_64-librsvg mingw-w64-x86_64-icoutils  mingw-w64-x86_64-ntldd
 program:all
-	@echo "######################   WINDOWS SETUP   ##########################"	
-	rm -f windows/nsis/*.dll
-	@echo "######################   DLLS  ##########################"
-	@cp $(TARGET).exe windows/nsis/
+	@echo "- ------------------------------- -"
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@echo "+      WINDOWS SETUP FILE         +"
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@rm -f windows/*.dll
+	@echo "- mingw64 /*.dlls --> windows/*.dll "
+	@cp $(TARGET).exe windows/
 	@ntldd -R $(TARGET).exe | awk '/mingw64.bin/ {print $$3}' | sort -u | \
-		while read -r dll; do cp "$$dll" windows/nsis/ ; done
-	@echo "DLLs copied to windows/nsis/"
-	#7z x windows/nsis/dlls.7z -owindows/nsis -y;
-	@echo "######################   nsis/installer.nsi  ##########################"
-	sed -e 's|@APP_VERSION@|$(VERSION)|g' -e 's|@APP_NAME@|$(TITLE)|g' windows/nsis/installer.nsi.in > windows/nsis/installer.nsi
-	@echo "######################   nsis/$(TARGET).ico  ##########################"
-	cp windows/Application/application.ico  windows/nsis/$(TARGET).ico
-	@echo "######################   nsis/$(TARGET)  ##########################"
-	cp $(TARGET) windows/nsis/$(TARGET)
-	rm -f windows/nsis/uninst.exe
-	@echo "######################   Nsis  ##########################"
-	cd windows/nsis && makensis installer.nsi
-	mv windows/nsis/$(TARGET)_Setup.exe ./$(TITLE)_$(VERSION)_Setup.exe
-	@rm -f windows/nsis/*.ico windows/nsis/*.exe windows/nsis/*.dll .deb windows/nsis/installer.nsi
-	@echo "#############   $(TITLE)_$(VERSION)_Setup.exe  IS READY  ####################"
+		while read -r dll; do cp "$$dll" windows/ ; done
+	@echo "+ windows/*.dll ready "
+	@echo "-  windows/installer.nsi.in --> windows/installer.nsi"
+	sed -e 's|@APP_VERSION@|$(VERSION)|g' -e 's|@APP_NAME@|$(TITLE)|g' windows/installer.nsi.in > windows/installer.nsi
+	@echo "- nsis/$(TARGET).ico "
+	cp windows/application.ico  windows/$(TARGET).ico
+	@echo "- windows/$(TARGET) "
+	cp $(TARGET) windows/$(TARGET)
+	@echo "-   Nsis   "
+	cd windows && makensis installer.nsi
+	mv windows/$(TARGET)_Setup.exe ./$(TITLE)_$(VERSION)_Setup.exe
+	@rm -f windows/*.ico windows/*.exe windows/*.dll windows/*.nsi 
+	@echo "+++++++++++++++++++++++++++++++++++"
+	@echo "+   $(TITLE)_$(VERSION)_Setup.exe    +"
+	@echo "+++++++++++++++++++++++++++++++++++"
 endif
-#pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-gtk3 mingw-w64-x86_64-libconfig mingw-w64-x86_64-nsis p7zip
-#pacman -S mingw-w64x86_64-librsvg mingw-w64x86_64-icoutils
 ####################################################################################################################
