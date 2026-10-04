@@ -1,8 +1,15 @@
-Package: @PACKAGENAME@
-Version: @VERSION@
+Source: @PACKAGENAME@
 Section: @SECTION@
 Priority: optional
-Architecture: @ARCH@
-Depends: @DEPS@
 Maintainer: @AUTOR@
-Description:@DESCRIPTION@
+Build-Depends: debhelper-compat (= 13),
+               libgtk-3-dev,
+               libconfig-dev,
+               libhidapi-dev,
+               pkg-config
+Standards-Version: 4.6.0
+
+Package: @PACKAGENAME@
+Architecture: @ARCH@
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: @DESCRIPTION@

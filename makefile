@@ -94,32 +94,86 @@ PREFIX   := /usr
 DEBARCH  := $(shell dpkg --print-architecture 2>/dev/null || echo amd64)
 STAGE    := debian/.deb/$(TARGET)-$(VERSION)
 DEBFILE  := $(TARGET)_$(VERSION)_$(DEBARCH).deb
-deb:all	
-	cp resources/icon.svg debian/$(TARGET).svg
-	@mkdir -p $(STAGE)/DEBIAN $(STAGE)$(PREFIX)/bin $(STAGE)$(PREFIX)/share/$(TARGET) $(STAGE)$(PREFIX)/share/icons/hicolor/scalable/apps $(STAGE)$(PREFIX)/share/doc/$(TARGET) $(STAGE)$(PREFIX)/share/applications
-	@echo "--Creating debian/$(TARGET).desktop"
-	sed -e 's/@PACKAGENAME@/$(TARGET)/g' -e 's/@TITLE@/$(TITLE)/g' -e 's/@DESCRIPTION@/$(DESCRIPTION)/g' debian/app.desktop.in > debian/$(TARGET).desktop
-	@echo "--Creating debian/copyright"
-	sed -e 's/@PACKAGENAME@/$(TARGET)/g' -e 's/@TITLE@/$(TITLE)/g' 	debian/copyright.in > debian/copyright
+
+DATE := $(shell date -R)
+
+deb:all
 	@echo "######################   DEB BASED LINUX   ##########################"
-	
+	@echo "--Creating debian/changelog"
+	@printf '%s\n' \
+	  '$(TARGET) ($(VERSION)-1) unstable; urgency=medium' \
+	  '' \
+	  '  * Initial release.' \
+	  '' \
+	  ' -- $(AUTOR)  $(DATE)' \
+	  > debian/changelog
+	# ---------- 1. Create staging directories ----------
+	@mkdir -p $(STAGE)/DEBIAN \
+	          $(STAGE)$(PREFIX)/bin \
+	          $(STAGE)$(PREFIX)/share/$(TARGET) \
+	          $(STAGE)$(PREFIX)/share/icons/hicolor/scalable/apps \
+	          $(STAGE)$(PREFIX)/share/doc/$(TARGET) \
+	          $(STAGE)$(PREFIX)/share/applications
+
+	# ---------- 2. Generate auxiliary files ----------
+	@echo "--Creating debian/$(TARGET).desktop"
+	@sed -e 's/@PACKAGENAME@/$(TARGET)/g' -e 's/@TITLE@/$(TITLE)/g' \
+	     -e 's/@DESCRIPTION@/$(DESCRIPTION)/g' \
+	     debian/app.desktop.in > debian/$(TARGET).desktop
+
+	@echo "--Creating debian/copyright"
+	@sed -e 's/@PACKAGENAME@/$(TARGET)/g' -e 's/@TITLE@/$(TITLE)/g' \
+	     debian/copyright.in > debian/copyright
+
+	@cp resources/icon.svg debian/$(TARGET).svg
+
+	# ---------- 3. Install files into STAGE ----------
 	@install -m 0755 $(TARGET) $(STAGE)$(PREFIX)/bin/$(TARGET)
 	@install -m 0644 debian/$(TARGET).desktop $(STAGE)$(PREFIX)/share/applications/
-	@install -m 0644 debian/$(TARGET).svg $(STAGE)$(PREFIX)/share/icons/hicolor/scalable/apps/$(TARGET).svg
+	@install -m 0644 debian/$(TARGET).svg \
+	    $(STAGE)$(PREFIX)/share/icons/hicolor/scalable/apps/$(TARGET).svg
 	@install -m 0644 debian/copyright $(STAGE)$(PREFIX)/share/doc/$(TARGET)/copyright
-	@DEPS=$$(dpkg-shlibdeps -O $(TARGET) 2>/dev/null | sed -n 's/^shlibs:Depends=//p'); \
-	sed -e 's/@PACKAGENAME@/$(TARGET)/g' -e 's/@VERSION@/$(VERSION)/g' -e 's/@DESCRIPTION@/$(DESCRIPTION)/g' -e 's/@AUTOR@/$(AUTOR)/g' \
-	-e 's/@SECTION@/$(SECTION)/g' -e 's/@ARCH@/$(DEBARCH)/g' -e "s|@DEPS@|$$DEPS|g" \
-	debian/control.in > $(STAGE)/DEBIAN/control
+
+	# ---------- 4. Generate debian/control from control.in ----------
+	#     (dpkg-shlibdeps and dpkg-gencontrol read this file)
+	@echo "--Creating debian/control from control.in"
+	@sed -e 's/@PACKAGENAME@/$(TARGET)/g' \
+	     -e 's/@VERSION@/$(VERSION)/g' \
+	     -e 's/@DESCRIPTION@/$(DESCRIPTION)/g' \
+	     -e 's/@AUTOR@/$(AUTOR)/g' \
+	     -e 's/@SECTION@/$(SECTION)/g' \
+	     -e 's/@ARCH@/$(DEBARCH)/g' \
+	     debian/control.in > debian/control
+
+	# ---------- 5. Extract shlibs dependencies ----------
+	#     dpkg-shlibdeps writes shlibs:Depends into debian/substvars
+	@echo "--Running dpkg-shlibdeps"
+	@dpkg-shlibdeps -O -e$(STAGE)$(PREFIX)/bin/$(TARGET) > debian/substvars
+	@echo "--debian/substvars:"
+	@cat debian/substvars
+
+	# ---------- 6. Generate final control file ----------
+	#     dpkg-gencontrol substitutes ${shlibs:Depends} and ${misc:Depends}
+	#     using debian/control + debian/substvars
+	@echo "--Running dpkg-gencontrol"
+	@dpkg-gencontrol -p$(TARGET) -P$(STAGE) -v$(VERSION) -DArchitecture=$(DEBARCH) -cdebian/control -Tdebian/substvars -O$(STAGE)/DEBIAN/control
+
+	# ---------- 7. Build the .deb package ----------
 	@dpkg-deb --root-owner-group --build $(STAGE) $(DEBFILE)
-	@rm -rf debian/.deb debian/copyright debian/$(TARGET).desktop debian/$(TARGET).svg
+
+	# ---------- 8. Clean up temporary files ----------
+	@rm -rf debian/.deb debian/copyright debian/$(TARGET).desktop debian/$(TARGET).svg debian/control debian/substvars debian/changelog debian/files
+
 	@echo "############### $(DEBFILE) IS READY ###################"
+
   else
 	@echo "deb: not a Debian-based system" >&2
 	@exit 1
   endif
 endif
 #sudo apt install libhidapi-dev librsvg2-bin icoutils
+#sudo apt install dpkg-dev debhelper libgtk-3-dev libconfig-dev libhidapi-dev
+#sudo apt install devscripts
 ####################################################################################################################
 ifeq ($(OS), Windows_NT)
 #pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-gtk3 mingw-w64-x86_64-libconfig mingw-w64-x86_64-nsis p7zip mingw-w64-x86_64-librsvg mingw-w64-x86_64-icoutils  mingw-w64-x86_64-ntldd
