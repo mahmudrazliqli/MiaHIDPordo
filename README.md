@@ -1,5 +1,5 @@
 # Mia HID Pordo
-
+# USBHIDTerminal for Linux and windows
 A simple GTK+ tool for inspecting and communicating with USB HID devices.
 Intended for electrical engineers who need to test HID reports, not for
 software developers.
