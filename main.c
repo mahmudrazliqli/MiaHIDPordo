@@ -21,6 +21,9 @@
 #define MANUAL_READ_TIMEOUT_MS 300    // Total wait time for manual read
 #define MANUAL_READ_STEP_MS 5         // Each step, mutex is released
 
+#define SHUTDOWN_WAIT_MAX_MS 5000
+#define SHUTDOWN_WAIT_STEP_MS 20
+
 #define BITS_TO_BYTES(b) ((unsigned int)(((unsigned long long)(b) + 7ULL) / 8ULL))
 
 #define CFG_DIR    ".config"
@@ -41,10 +44,10 @@ typedef struct {
 } ReportSizes;
 
 typedef struct {
-    GtkWidget *input_view;   /* GtkListBox: one GtkLabel row per log line */
-    GtkWidget *log_scroll;   /* GtkScrolledWindow around input_view */
-    int log_rows;            /* rows currently in the list (ring buffer size) */
-    gboolean autoscroll;     /* TRUE while the view is stuck to the bottom */
+    GtkWidget *input_view;
+    GtkWidget *log_scroll;
+    int log_rows;
+    gboolean autoscroll;
     GtkWidget *output_entry;
     GtkWidget *feature_entry;
     GtkWidget *send_btn;
@@ -54,8 +57,8 @@ typedef struct {
     unsigned char report_id;
     int has_report_id;
     ReportSizes sizes;
-    GPtrArray *pending;      /* queued log lines, flushed in batches */
-    guint flush_id;          /* GSource id of the pending flush timer */
+    GPtrArray *pending;      /* queued markup lines (already escaped) */
+    guint flush_id;
 } ReportBOX;
 
 typedef struct {
@@ -87,6 +90,7 @@ typedef struct {
     gint log_font_size;
 
     gint manual_reads_active;
+    gint sync_ops_active;
 
     unsigned char *raw_descriptor;
     int raw_descriptor_len;
@@ -107,6 +111,7 @@ static gpointer reader_thread_func(gpointer data);
 static void stop_reader_thread(void);
 static void clear_tabs(void);
 static void connect_device(void);
+static void wait_for_hid_ops(void);
 
 /* ---------- Helper functions ---------- */
 
@@ -114,7 +119,6 @@ static int is_hex_mode(void) {
     return g_atomic_int_get(&app.hex_mode);
 }
 
-/* Global CSS provider for the log views (monospace + size). */
 static GtkCssProvider *log_font_css = NULL;
 
 static void ensure_log_css_provider(void)
@@ -127,16 +131,14 @@ static void ensure_log_css_provider(void)
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
 }
 
-/* Tag a list box as "log-view"; actual styling is set once globally. */
-static void apply_font_to_view(GtkWidget *view, int size)
+static void apply_font_to_view(GtkWidget *view)
 {
-    (void)size;
     if (!view || !GTK_IS_LIST_BOX(view)) return;
     GtkStyleContext *ctx = gtk_widget_get_style_context(view);
-    gtk_style_context_add_class(ctx, "log-view");
+    if (!gtk_style_context_has_class(ctx, "log-view"))
+        gtk_style_context_add_class(ctx, "log-view");
 }
 
-/* Update global CSS with new font size and (re)tag all existing views. */
 static void apply_log_font_size(int size)
 {
     if (size < 6)  size = 6;
@@ -153,7 +155,7 @@ static void apply_log_font_size(int size)
     for (int i = 0; i < MAX_REPORT_ID; i++) {
         ReportBOX *t = app.tabs[i];
         if (t && t->input_view)
-            apply_font_to_view(t->input_view, size);
+            apply_font_to_view(t->input_view);
     }
 }
 
@@ -214,7 +216,10 @@ static int parse_input(const char *str, unsigned char *out, int max_len) {
                 p++;
             if (!*p) break;
 
-            if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+            /* Skip "0x" only when followed by at least one hex digit */
+            if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&
+                isxdigit((unsigned char)p[2]))
+                p += 2;
 
             unsigned int val = 0;
             int digits = 0;
@@ -243,20 +248,38 @@ static int parse_input(const char *str, unsigned char *out, int max_len) {
 #define LOG_FLUSH_INTERVAL_MS 50
 #define LOG_META_OPEN "<span foreground='#1565C0' size='small'>"
 
-/* Build Pango markup for one log line. The part up to "bytes): " (or the
- * whole line when all_meta / no marker) is blue+small; the payload is plain. */
-static char *make_markup(const char *line, size_t len, gboolean all_meta) {
-    static const char *marker = "bytes): ";
-    const char *split = all_meta ? NULL : g_strstr_len(line, (gssize)len, marker);
-    size_t meta_len = split ? (size_t)(split - line) + strlen(marker) : len;
+/*
+ * Build the final Pango markup for one log line from three explicit parts:
+ *   prefix   : short tag like "OUT ", "IN  ", "FEAT", "READ", "DESC"
+ *   meta     : descriptive text, shown in blue small (may be NULL/empty)
+ *   payload  : data payload, shown in the default colour (may be NULL/empty)
+ *
+ * No searching inside the string happens here.  The boundary between meta
+ * and payload is decided by the caller, not by inspecting the content.
+ * That way a payload that happens to contain "bytes): " (or any other
+ * marker) can never confuse the rendering.
+ */
+static char *build_log_markup(const char *prefix, const char *meta, const char *payload)
+{
+    const char *p = prefix  ? prefix  : "";
+    const char *m = meta    ? meta    : "";
+    const char *d = payload ? payload : "";
 
-    char *meta = g_markup_escape_text(line, (gssize)meta_len);
-    char *rest = split ? g_markup_escape_text(line + meta_len, (gssize)(len - meta_len))
-                       : g_strdup("");
-    char *out = g_strdup_printf(LOG_META_OPEN "%s</span>%s", meta, rest);
-    g_free(meta);
-    g_free(rest);
-    return out;
+    char *header;
+    if (*m)
+        header = g_strdup_printf("[%s] %s", p, m);
+    else
+        header = g_strdup_printf("[%s]", p);
+
+    char *header_esc = g_markup_escape_text(header, -1);
+    char *payload_esc = g_markup_escape_text(d, -1);
+    g_free(header);
+
+    char *markup = g_strdup_printf(LOG_META_OPEN "%s</span>%s",
+                                   header_esc, payload_esc);
+    g_free(header_esc);
+    g_free(payload_esc);
+    return markup;
 }
 
 static void tab_append_row(ReportBOX *tab, const char *markup) {
@@ -273,7 +296,6 @@ static void tab_append_row(ReportBOX *tab, const char *markup) {
     tab->log_rows++;
 }
 
-/* Ring buffer: drop the oldest rows beyond MAX_LOG_LINES. */
 static void tab_trim_rows(ReportBOX *tab) {
     while (tab->log_rows > MAX_LOG_LINES) {
         GtkListBoxRow *row =
@@ -291,7 +313,6 @@ static void tab_clear_rows(ReportBOX *tab) {
     tab->log_rows = 0;
 }
 
-/* Auto-scroll: only when the tab is visible (mapped) and stuck to the bottom. */
 static void tab_scroll_to_end(ReportBOX *tab) {
     if (!tab->log_scroll || !tab->autoscroll) return;
     if (!gtk_widget_get_mapped(tab->log_scroll)) return;
@@ -301,26 +322,23 @@ static void tab_scroll_to_end(ReportBOX *tab) {
                                   gtk_adjustment_get_page_size(adj));
 }
 
-/* content size changed (rows added/removed) -> follow the end */
 static void on_log_vadj_changed(GtkAdjustment *adj, gpointer data) {
     (void)adj;
     tab_scroll_to_end((ReportBOX *)data);
 }
 
-/* user (or we) moved the scrollbar -> remember whether we are at the bottom */
 static void on_log_vadj_value_changed(GtkAdjustment *adj, gpointer data) {
     ReportBOX *tab = (ReportBOX *)data;
     double bottom = gtk_adjustment_get_upper(adj) - gtk_adjustment_get_page_size(adj);
     tab->autoscroll = gtk_adjustment_get_value(adj) >= bottom - 4.0;
 }
 
-/* tab became visible again -> jump to the end if it was following it */
 static void on_log_scroll_map(GtkWidget *w, gpointer data) {
     (void)w;
     tab_scroll_to_end((ReportBOX *)data);
 }
 
-/* Write every queued line as a row now. */
+/* Push queued markup strings into the ListBox. */
 static void tab_flush(ReportBOX *tab) {
     if (tab->flush_id) {
         g_source_remove(tab->flush_id);
@@ -328,17 +346,12 @@ static void tab_flush(ReportBOX *tab) {
     }
     if (!tab->input_view || !tab->pending || tab->pending->len == 0) return;
 
-    /* Only the last MAX_LOG_LINES lines can survive trimming anyway. */
     guint first = tab->pending->len > (guint)MAX_LOG_LINES
                 ? tab->pending->len - (guint)MAX_LOG_LINES : 0;
 
     for (guint i = first; i < tab->pending->len; i++) {
-        const char *line = g_ptr_array_index(tab->pending, i);
-        size_t n = strlen(line);
-        if (n > 0 && line[n - 1] == '\n') n--;
-        char *markup = make_markup(line, n, FALSE);
+        const char *markup = g_ptr_array_index(tab->pending, i);
         tab_append_row(tab, markup);
-        g_free(markup);
     }
     g_ptr_array_set_size(tab->pending, 0);
 
@@ -347,7 +360,7 @@ static void tab_flush(ReportBOX *tab) {
 
 static gboolean flush_tab_cb(gpointer data) {
     ReportBOX *tab = (ReportBOX *)data;
-    tab->flush_id = 0;          /* this source is removed by the return value */
+    tab->flush_id = 0;
     tab_flush(tab);
     return G_SOURCE_REMOVE;
 }
@@ -360,7 +373,6 @@ static void tab_discard_pending(ReportBOX *tab) {
     if (tab->pending) g_ptr_array_set_size(tab->pending, 0);
 }
 
-/* Destroy-notify for the tab: stop the timer, free the queue. */
 static void report_box_free(gpointer data) {
     ReportBOX *tab = (ReportBOX *)data;
     if (!tab) return;
@@ -369,15 +381,25 @@ static void report_box_free(gpointer data) {
     g_free(tab);
 }
 
-static void log_to_tab(ReportBOX *tab, const char *prefix, const char *text) {
+/*
+ * Enqueue one log line.  prefix and meta are rendered as blue/small, payload
+ * is rendered as plain text.  Both meta and payload may be NULL or "".
+ *
+ * The final markup string is built here, escaped once, and stored in the
+ * pending queue.  tab_flush just appends it as-is.
+ */
+static void log_to_tab(ReportBOX *tab, const char *prefix,
+                       const char *meta, const char *payload)
+{
     if (!tab || !tab->input_view || !tab->pending) return;
 
-    char *line = g_strdup_printf("[%s] %s\n", prefix, text);
-    /* keep the old size limit on a single line */
+    char *markup = build_log_markup(prefix, meta, payload);
+
+    /* Enforce the old single-line size limit. */
     size_t max = HEX_BUF_SIZE + 255;
-    size_t n = strlen(line);
-    if (n > max) { line[max - 1] = '\n'; line[max] = '\0'; }
-    g_ptr_array_add(tab->pending, line);
+    if (strlen(markup) > max) markup[max] = '\0';
+
+    g_ptr_array_add(tab->pending, markup);
 
     if (!tab->flush_id)
         tab->flush_id = g_timeout_add(LOG_FLUSH_INTERVAL_MS, flush_tab_cb, tab);
@@ -393,10 +415,17 @@ static const char *get_config_path(void) {
     const char *home = g_get_home_dir();
     if (!home || !*home) home = ".";
     char *dir = g_build_filename(home, CFG_DIR, NULL);
-    g_mkdir_with_parents(dir, 0755);
+    g_mkdir_with_parents(dir, 0700);
     cfg_path = g_build_filename(dir, CFG_NAME, NULL);
     g_free(dir);
     return cfg_path;
+}
+
+static gboolean is_wayland_session(void) {
+    GdkDisplay *d = gdk_display_get_default();
+    if (!d) return FALSE;
+    const char *name = gdk_display_get_name(d);
+    return name && g_str_has_prefix(name, "wayland");
 }
 
 static void apply_pending_device(void) {
@@ -438,7 +467,7 @@ static void load_config(void) {
     if (app.window) {
         if (has_w && has_h && w > 0 && h > 0)
             gtk_window_resize(GTK_WINDOW(app.window), w, h);
-        if (has_x && has_y && x >= 0 && y >= 0)
+        if (!is_wayland_session() && has_x && has_y && x >= 0 && y >= 0)
             gtk_window_move(GTK_WINDOW(app.window), x, y);
     }
 
@@ -448,13 +477,11 @@ static void load_config(void) {
         pending_last_device = g_strdup(last_dev);
     }
 
-    /* Restore log font size */
     int fs = 10;
     if (config_lookup_int(&cfg, "log_font_size", &fs) && app.font_spin) {
         if (fs < 6)  fs = 6;
         if (fs > 48) fs = 48;
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(app.font_spin), fs);
-        /* Signal handler will call apply_log_font_size */
     }
 
     config_destroy(&cfg);
@@ -478,7 +505,8 @@ static void save_config(void) {
     int w = 0, h = 0, x = -1, y = -1;
     if (app.window) {
         gtk_window_get_size(GTK_WINDOW(app.window), &w, &h);
-        gtk_window_get_position(GTK_WINDOW(app.window), &x, &y);
+        if (!is_wayland_session())
+            gtk_window_get_position(GTK_WINDOW(app.window), &x, &y);
     }
     s = config_setting_add(root, "window_width",  CONFIG_TYPE_INT); config_setting_set_int(s, w);
     s = config_setting_add(root, "window_height", CONFIG_TYPE_INT); config_setting_set_int(s, h);
@@ -511,7 +539,8 @@ typedef struct {
     unsigned char report_id;
 } GlobalState;
 
-static void parse_report_descriptor(const unsigned char *desc, int len, ReportSizes *out_sizes, int *has_report_id) {
+static void parse_report_descriptor(const unsigned char *desc, int len,
+                                    ReportSizes *out_sizes, int *has_report_id) {
     GlobalState cur = {0, 0, 0};
     GlobalState stack[MAX_GLOBAL_STACK];
     int sp = 0;
@@ -575,8 +604,9 @@ static void parse_report_descriptor(const unsigned char *desc, int len, ReportSi
 
 /* ---------- Input data routing ---------- */
 
-static void route_input_data(const unsigned char *buf, int n, int has_report_id, const char *prefix) {
-    char msg[HEX_BUF_SIZE + 256];
+static void route_input_data(const unsigned char *buf, int n, int has_report_id,
+                             const char *prefix) {
+    char meta[64];
     char disp[HEX_BUF_SIZE];
     int offset = 0;
     unsigned char rid = 0;
@@ -589,26 +619,40 @@ static void route_input_data(const unsigned char *buf, int n, int has_report_id,
     if (payload_len <= 0) return;
 
     format_bytes(buf + offset, payload_len, disp, sizeof(disp));
+    snprintf(meta, sizeof(meta), "RECV %2d bytes: ", payload_len);
 
     if (!has_report_id) {
         ReportBOX *tab = app.tabs[0];
-        if (tab) {
-            snprintf(msg, sizeof(msg), "RECV (%d bytes): %s", payload_len, disp);
-            log_to_tab(tab, prefix, msg);
-        }
+        if (tab) log_to_tab(tab, prefix, meta, disp);
     } else {
         ReportBOX *tab = app.tabs[rid];
         if (tab) {
-            snprintf(msg, sizeof(msg), "RECV (%d bytes): %s", payload_len, disp);
-            log_to_tab(tab, prefix, msg);
+            log_to_tab(tab, prefix, meta, disp);
         } else {
             char status[160];
-            snprintf(status, sizeof(status),
-                     "Input on unknown Report ID 0x%02X (%d bytes)",
+            snprintf(status, sizeof(status),"Input on unknown Report ID 0x%02X %2d bytes",
                      rid, payload_len);
             gtk_label_set_text(GTK_LABEL(app.status_label), status);
         }
     }
+}
+
+/* ---------- Wait helper for in-flight HID operations ---------- */
+
+/*
+ * Block until all in-flight sync operations and manual reads have
+ * completed.  Called before closing a device or clearing the HID mutex
+ * so that no thread can be touching the mutex or the device handle.
+ */
+static void wait_for_hid_ops(void) {
+    int steps = SHUTDOWN_WAIT_MAX_MS / SHUTDOWN_WAIT_STEP_MS;
+    for (int i = 0; i < steps; i++) {
+        if (g_atomic_int_get(&app.sync_ops_active) == 0 &&
+            g_atomic_int_get(&app.manual_reads_active) == 0)
+            return;
+        g_usleep(SHUTDOWN_WAIT_STEP_MS * 1000);
+    }
+    g_warning("wait_for_hid_ops: timed out waiting for HID operations");
 }
 
 /* ---------- HID operations on separate thread ---------- */
@@ -619,8 +663,14 @@ enum {
     OP_FEATURE_GET
 };
 
+/*
+ * IMPORTANT: no pointer to ReportBOX is stored here.  Between the time the
+ * thread starts and the idle callback runs, the notebook may have been
+ * rebuilt and the ReportBOX freed.  We store the report id and look up the
+ * live tab inside the idle callback instead.
+ */
 typedef struct {
-    ReportBOX *tab;
+    unsigned char rid;
     gint generation;
     int op;
 
@@ -642,47 +692,58 @@ static gboolean sync_op_done(gpointer data) {
     if (op->generation != g_atomic_int_get(&app.tabs_generation))
         return G_SOURCE_REMOVE;
 
-    ReportBOX *tab = app.tabs[op->tab->report_id];
-    if (!tab || tab != op->tab) return G_SOURCE_REMOVE;
+    ReportBOX *tab = app.tabs[op->rid];
+    if (!tab) return G_SOURCE_REMOVE;
 
+    char meta[320];
     char disp[HEX_BUF_SIZE];
-    char msg[HEX_BUF_SIZE + 256];
 
     if (op->op == OP_OUTPUT) {
-        format_bytes(op->payload, op->payload_len, disp, sizeof(disp));
         int expect = op->payload_len + 1;
-        if (op->status < 0)
-            snprintf(msg, sizeof(msg), "hid_write failed: %s", op->errmsg);
-        else if (op->bytes != expect)
-            snprintf(msg, sizeof(msg), "hid_write short: %d of %d bytes", op->bytes, expect);
-        else
-            snprintf(msg, sizeof(msg), "SENT (%d bytes): %s", op->payload_len, disp);
-        log_to_tab(tab, "OUT ", msg);
+        if (op->status < 0) {
+            snprintf(meta, sizeof(meta), "hid_write failed: %s", op->errmsg);
+            log_to_tab(tab, "OUT ", meta, NULL);
+        } else if (op->bytes != expect) {
+            snprintf(meta, sizeof(meta),
+                     "hid_write short: %d of %2d bytes", op->bytes, expect);
+            log_to_tab(tab, "OUT ", meta, NULL);
+        } else {
+            format_bytes(op->payload, op->payload_len, disp, sizeof(disp));
+            snprintf(meta, sizeof(meta), "SENT %2d bytes: ", op->payload_len);
+            log_to_tab(tab, "OUT ", meta, disp);
+        }
 
     } else if (op->op == OP_FEATURE_SET) {
-        format_bytes(op->payload, op->payload_len, disp, sizeof(disp));
         int expect = op->payload_len + 1;
-        if (op->status < 0)
-            snprintf(msg, sizeof(msg), "hid_send_feature_report failed: %s", op->errmsg);
-        else if (op->bytes != expect)
-            snprintf(msg, sizeof(msg), "hid_send_feature_report short: %d of %d bytes",
+        if (op->status < 0) {
+            snprintf(meta, sizeof(meta),
+                     "hid_send_feature_report failed: %s", op->errmsg);
+            log_to_tab(tab, "FEAT", meta, NULL);
+        } else if (op->bytes != expect) {
+            snprintf(meta, sizeof(meta),
+                     "hid_send_feature_report short: %d of %2d bytes",
                      op->bytes, expect);
-        else
-            snprintf(msg, sizeof(msg), "SET  (%d bytes): %s", op->payload_len, disp);
-        log_to_tab(tab, "FEAT", msg);
+            log_to_tab(tab, "FEAT", meta, NULL);
+        } else {
+            format_bytes(op->payload, op->payload_len, disp, sizeof(disp));
+            snprintf(meta, sizeof(meta), "SET  %2d bytes: ", op->payload_len);
+            log_to_tab(tab, "FEAT", meta, disp);
+        }
 
     } else {
         if (op->status < 0) {
-            snprintf(msg, sizeof(msg), "hid_get_feature_report failed: %s", op->errmsg);
+            snprintf(meta, sizeof(meta),
+                     "hid_get_feature_report failed: %s", op->errmsg);
+            log_to_tab(tab, "FEAT", meta, NULL);
         } else if (op->bytes == 0) {
-            snprintf(msg, sizeof(msg), "RECV (0 bytes)");
+            log_to_tab(tab, "FEAT", "RECV (0 bytes)", NULL);
         } else {
             int payload_len = op->bytes - 1;
             if (payload_len < 0) payload_len = 0;
             format_bytes(op->resp + 1, payload_len, disp, sizeof(disp));
-            snprintf(msg, sizeof(msg), "GET  (%d bytes): %s", payload_len, disp);
+            snprintf(meta, sizeof(meta), "GET  %2d bytes: ", payload_len);
+            log_to_tab(tab, "FEAT", meta, disp);
         }
-        log_to_tab(tab, "FEAT", msg);
     }
     return G_SOURCE_REMOVE;
 }
@@ -750,13 +811,17 @@ static gpointer sync_op_thread(gpointer data) {
     }
 
     g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, sync_op_done, op, g_free);
+    g_atomic_int_dec_and_test(&app.sync_ops_active);
     return NULL;
 }
 
 static void start_sync_op(SyncOp *op, const char *fail_prefix) {
+    g_atomic_int_inc(&app.sync_ops_active);
     GThread *t = g_thread_new("hid_sync", sync_op_thread, op);
     if (!t) {
-        log_to_tab(op->tab, fail_prefix, "failed to start sync thread");
+        g_atomic_int_dec_and_test(&app.sync_ops_active);
+        ReportBOX *tab = app.tabs[op->rid];
+        if (tab) log_to_tab(tab, fail_prefix, "failed to start sync thread", NULL);
         g_free(op);
         return;
     }
@@ -769,39 +834,37 @@ static void on_send_output(GtkButton *b, gpointer data) {
     (void)b;
     ReportBOX *tab = (ReportBOX *)data;
     if (!g_atomic_int_get(&app.connected)) {
-        log_to_tab(tab, "OUT ", "not connected");
+        log_to_tab(tab, "OUT ", "not connected", NULL);
         return;
     }
     if (tab->sizes.output_bytes == 0) {
-        log_to_tab(tab, "OUT ", "this report has no Output capability");
+        log_to_tab(tab, "OUT ", "this report has no Output capability", NULL);
         return;
     }
 
     const char *txt = gtk_entry_get_text(GTK_ENTRY(tab->output_entry));
     unsigned char buf[MAX_REPORT_BYTES];
     int n = parse_input(txt, buf, sizeof(buf));
-    if (n == 0) { log_to_tab(tab, "OUT ", "(empty)"); return; }
+    if (n == 0) { log_to_tab(tab, "OUT ", "(empty)", NULL); return; }
 
     int target = (int)tab->sizes.output_bytes;
     if (target > MAX_REPORT_BYTES) target = MAX_REPORT_BYTES;
 
     if (n > target) {
         char warn[160];
-        snprintf(warn, sizeof(warn),
-                 "WARNING: %d bytes > max %d bytes (sending anyway)", n, target);
-        log_to_tab(tab, "OUT ", warn);
+        snprintf(warn, sizeof(warn),"WARNING: %2d bytes > max %2d bytes (sending anyway)", n, target);
+        log_to_tab(tab, "OUT ", warn, NULL);
     } else if (n < target) {
         char warn[160];
-        snprintf(warn, sizeof(warn),
-                 "WARNING: %d bytes < %d bytes (padding with \\0 )", n, target);
-        log_to_tab(tab, "OUT ", warn);
+        snprintf(warn, sizeof(warn),"WARNING: %2d bytes < %2d bytes (padding with \\0 )", n, target);
+        log_to_tab(tab, "OUT ", warn, NULL);
         for (int i = n; i < target; i++)
             buf[i] = 0;
         n = target;
     }
 
     SyncOp *op = g_new0(SyncOp, 1);
-    op->tab = tab;
+    op->rid = tab->report_id;
     op->generation = g_atomic_int_get(&app.tabs_generation);
     op->op = OP_OUTPUT;
     memcpy(op->payload, buf, n);
@@ -814,8 +877,8 @@ static void on_send_output(GtkButton *b, gpointer data) {
 
 /* ---------- Read Input (manual) ---------- */
 
+/* Same lifetime rule as SyncOp: only rid + generation, no tab pointer. */
 typedef struct {
-    ReportBOX *tab;
     unsigned char rid;
     int has_rid;
     gint generation;
@@ -833,30 +896,55 @@ static gboolean deliver_manual_read(gpointer data) {
         return G_SOURCE_REMOVE;
 
     ReportBOX *tab = app.tabs[r->rid];
-    if (!tab || tab != r->tab) return G_SOURCE_REMOVE;
+    if (!tab) {
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "Read on unknown Report ID 0x%02X (dropped)", r->rid);
+        if (app.status_label)
+            gtk_label_set_text(GTK_LABEL(app.status_label), msg);
+        return G_SOURCE_REMOVE;
+    }
 
     if (r->len > 0) {
         route_input_data(r->data, r->len, 1, "READ");
     } else if (r->len == 0) {
-        log_to_tab(tab, "READ", "timeout (no data)");
+        log_to_tab(tab, "READ", "timeout (no data)", NULL);
     } else {
-        char msg[512];
-        snprintf(msg, sizeof(msg), "READ failed: %s", r->errmsg);
-        log_to_tab(tab, "READ", msg);
+        char meta[512];
+        snprintf(meta, sizeof(meta), "READ failed: %s", r->errmsg);
+        log_to_tab(tab, "READ", meta, NULL);
     }
     return G_SOURCE_REMOVE;
 }
 
+/*
+ * Manual read: poll the device for up to MANUAL_READ_TIMEOUT_MS using
+ * hid_read_timeout, which enforces a bounded wait per step (unlike
+ * hid_get_input_report, which can block indefinitely on some backends).
+ * If the device uses numbered reports, only a report whose ID matches the
+ * requested one is accepted; anything else is discarded.  If the reader
+ * thread is running concurrently, the mutex serialises the two, so the
+ * reader gets a chance between steps.
+ */
 static gpointer manual_read_thread(gpointer data) {
     ManualReadResult *r = (ManualReadResult *)data;
     int waited_ms = 0;
 
     r->len = 0;
 
+    int want = (int)app.main_sizes[r->rid].input_bytes + 1;
+    if (want > MAX_READ_BUF) want = MAX_READ_BUF;
+
     while (waited_ms < MANUAL_READ_TIMEOUT_MS) {
+        if (!g_atomic_int_get(&app.connected)) {
+            r->len = -1;
+            snprintf(r->errmsg, sizeof(r->errmsg), "not connected");
+            break;
+        }
+
         g_mutex_lock(&app.hid_mutex);
         hid_device *dev = app.dev;
-        if (!dev || !g_atomic_int_get(&app.connected)) {
+        if (!dev) {
             r->len = -1;
             snprintf(r->errmsg, sizeof(r->errmsg), "not connected");
             g_mutex_unlock(&app.hid_mutex);
@@ -866,9 +954,6 @@ static gpointer manual_read_thread(gpointer data) {
         unsigned char buf[MAX_READ_BUF];
         memset(buf, 0, sizeof(buf));
         buf[0] = r->has_rid ? r->rid : 0x00;
-
-        int want = (int)r->tab->sizes.input_bytes + 1;
-        if (want > MAX_READ_BUF) want = MAX_READ_BUF;
 
         int n = hid_get_input_report(dev, buf, want);
 
@@ -890,25 +975,23 @@ static gpointer manual_read_thread(gpointer data) {
         waited_ms += MANUAL_READ_STEP_MS;
     }
 
-    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, deliver_manual_read, r, g_free);
     g_atomic_int_dec_and_test(&app.manual_reads_active);
+    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, deliver_manual_read, r, g_free);
     return NULL;
 }
-
 static void on_read_input(GtkButton *b, gpointer data) {
     (void)b;
     ReportBOX *tab = (ReportBOX *)data;
     if (!g_atomic_int_get(&app.connected)) {
-        log_to_tab(tab, "READ", "not connected");
+        log_to_tab(tab, "READ", "not connected", NULL);
         return;
     }
     if (tab->sizes.input_bytes == 0) {
-        log_to_tab(tab, "READ", "this report has no Input capability");
+        log_to_tab(tab, "READ", "this report has no Input capability", NULL);
         return;
     }
 
     ManualReadResult *r = g_new0(ManualReadResult, 1);
-    r->tab = tab;
     r->rid = tab->report_id;
     r->has_rid = tab->has_report_id;
     r->generation = g_atomic_int_get(&app.tabs_generation);
@@ -918,7 +1001,7 @@ static void on_read_input(GtkButton *b, gpointer data) {
     GThread *t = g_thread_new("hid_manual_read", manual_read_thread, r);
     if (!t) {
         g_atomic_int_dec_and_test(&app.manual_reads_active);
-        log_to_tab(tab, "READ", "failed to start read thread");
+        log_to_tab(tab, "READ", "failed to start read thread", NULL);
         g_free(r);
         return;
     }
@@ -931,39 +1014,37 @@ static void on_send_feature(GtkButton *b, gpointer data) {
     (void)b;
     ReportBOX *tab = (ReportBOX *)data;
     if (!g_atomic_int_get(&app.connected)) {
-        log_to_tab(tab, "FEAT", "not connected");
+        log_to_tab(tab, "FEAT", "not connected", NULL);
         return;
     }
     if (tab->sizes.feature_bytes == 0) {
-        log_to_tab(tab, "FEAT", "this report has no Feature capability");
+        log_to_tab(tab, "FEAT", "this report has no Feature capability", NULL);
         return;
     }
 
     const char *txt = gtk_entry_get_text(GTK_ENTRY(tab->feature_entry));
     unsigned char buf[MAX_REPORT_BYTES];
     int n = parse_input(txt, buf, sizeof(buf));
-    if (n == 0) { log_to_tab(tab, "FEAT", "(empty)"); return; }
+    if (n == 0) { log_to_tab(tab, "FEAT", "(empty)", NULL); return; }
 
     int target = (int)tab->sizes.feature_bytes;
     if (target > MAX_REPORT_BYTES) target = MAX_REPORT_BYTES;
 
     if (n > target) {
         char warn[160];
-        snprintf(warn, sizeof(warn),
-                 "WARNING: %d bytes > max %d bytes (sending anyway)", n, target);
-        log_to_tab(tab, "FEAT", warn);
+        snprintf(warn, sizeof(warn),"WARNING: %2d bytes > max %2d bytes (sending anyway)", n, target);
+        log_to_tab(tab, "FEAT", warn, NULL);
     } else if (n < target) {
         char warn[160];
-        snprintf(warn, sizeof(warn),
-                 "WARNING: %d bytes < %d bytes (padding with \\0)", n, target);
-        log_to_tab(tab, "FEAT", warn);
+        snprintf(warn, sizeof(warn),"WARNING: %2d bytes < %2d bytes (padding with \\0)", n, target);
+        log_to_tab(tab, "FEAT", warn, NULL);
         for (int i = n; i < target; i++)
             buf[i] = 0;
         n = target;
     }
 
     SyncOp *op = g_new0(SyncOp, 1);
-    op->tab = tab;
+    op->rid = tab->report_id;
     op->generation = g_atomic_int_get(&app.tabs_generation);
     op->op = OP_FEATURE_SET;
     memcpy(op->payload, buf, n);
@@ -978,11 +1059,11 @@ static void on_get_feature(GtkButton *b, gpointer data) {
     (void)b;
     ReportBOX *tab = (ReportBOX *)data;
     if (!g_atomic_int_get(&app.connected)) {
-        log_to_tab(tab, "FEAT", "not connected");
+        log_to_tab(tab, "FEAT", "not connected", NULL);
         return;
     }
     if (tab->sizes.feature_bytes == 0) {
-        log_to_tab(tab, "FEAT", "this report has no Feature capability");
+        log_to_tab(tab, "FEAT", "this report has no Feature capability", NULL);
         return;
     }
 
@@ -991,7 +1072,7 @@ static void on_get_feature(GtkButton *b, gpointer data) {
     if (read_len > MAX_REPORT_BYTES) read_len = MAX_REPORT_BYTES;
 
     SyncOp *op = g_new0(SyncOp, 1);
-    op->tab = tab;
+    op->rid = tab->report_id;
     op->generation = g_atomic_int_get(&app.tabs_generation);
     op->op = OP_FEATURE_GET;
     op->report_id = tab->report_id;
@@ -1133,7 +1214,6 @@ static void on_pause_clicked(GtkButton *b, gpointer data) {
 
 /* ---------- View construction ---------- */
 
-/* Ctrl+Scroll on the scrolled window changes the font size */
 static gboolean on_view_scroll(GtkWidget *w, GdkEvent *event, gpointer data)
 {
     (void)w; (void)data;
@@ -1176,12 +1256,12 @@ static GtkWidget *make_terminal_view(ReportBOX *tab) {
     tab->log_rows   = 0;
     tab->autoscroll = TRUE;
 
-    GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scrolled));
+    GtkAdjustment *vadj =
+        gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scrolled));
     g_signal_connect(vadj, "changed",       G_CALLBACK(on_log_vadj_changed),       tab);
     g_signal_connect(vadj, "value-changed", G_CALLBACK(on_log_vadj_value_changed), tab);
     g_signal_connect(scrolled, "map",       G_CALLBACK(on_log_scroll_map),         tab);
 
-    /* Ctrl+Scroll intercept */
     gtk_widget_add_events(scrolled, GDK_SCROLL_MASK);
     g_signal_connect(scrolled, "scroll-event", G_CALLBACK(on_view_scroll), NULL);
 
@@ -1224,20 +1304,17 @@ static void build_tabs(const unsigned char *desc, int len)
     parse_report_descriptor(desc, len, app.main_sizes, &has_id);
     g_atomic_int_set(&app.has_report_id, has_id);
 
-    int current_font = g_atomic_int_get(&app.log_font_size);
-    if (current_font < 6) current_font = 10;
-
     for (int id = 0; id < MAX_REPORT_ID; id++) {
         ReportSizes *hidsizes = &app.main_sizes[id];
         if (!hidsizes->input_bytes && !hidsizes->output_bytes && !hidsizes->feature_bytes)
             continue;
 
         char tab_title[32];
-        if (!has_id)
+        if (!has_id){
             snprintf(tab_title, sizeof(tab_title), "Default");
-        else
+        }else{
             snprintf(tab_title, sizeof(tab_title), "Report ID:0x%02X", (unsigned)id);
-
+		}
         ReportBOX *tab = g_new0(ReportBOX, 1);
         tab->report_id = id;
         tab->has_report_id = has_id ? 1 : 0;
@@ -1248,9 +1325,7 @@ static void build_tabs(const unsigned char *desc, int len)
         gtk_container_set_border_width(GTK_CONTAINER(vbox), 6);
 
         GtkWidget *scrolled = make_terminal_view(tab);
-
-        /* Apply current font size to the new view immediately */
-        apply_font_to_view(tab->input_view, current_font);
+        apply_font_to_view(tab->input_view);
 
         gtk_box_pack_start(GTK_BOX(vbox), scrolled, TRUE, TRUE, 0);
 
@@ -1296,8 +1371,7 @@ static void build_tabs(const unsigned char *desc, int len)
 
             tab->get_feat_btn = gtk_button_new_with_label("Get Feature");
             gtk_widget_set_size_request(tab->get_feat_btn, 140, -1);
-            g_signal_connect(tab->get_feat_btn, "clicked",
-                             G_CALLBACK(on_get_feature), tab);
+            g_signal_connect(tab->get_feat_btn, "clicked",G_CALLBACK(on_get_feature), tab);
             gtk_box_pack_start(GTK_BOX(hbox2), tab->get_feat_btn, FALSE, FALSE, 0);
         }
 
@@ -1305,8 +1379,7 @@ static void build_tabs(const unsigned char *desc, int len)
         gtk_box_pack_start(GTK_BOX(vbox), hbox2, FALSE, FALSE, 0);
 
         g_object_set_data_full(G_OBJECT(vbox), "report_box", tab, report_box_free);
-        gtk_notebook_append_page(GTK_NOTEBOOK(app.notebook),
-                                 vbox, gtk_label_new(tab_title));
+        gtk_notebook_append_page(GTK_NOTEBOOK(app.notebook),vbox, gtk_label_new(tab_title));
         gtk_widget_show_all(vbox);
         app.tabs[id] = tab;
         app.tab_count++;
@@ -1345,27 +1418,56 @@ static const char *usage_page_name(unsigned int page) {
 }
 
 static const char *usage_name(unsigned int page, unsigned int usage) {
-    if (page == 0x01) {
-        switch (usage) {
-            case 0x00: return "Undefined";
-            case 0x01: return "Pointer";
-            case 0x02: return "Mouse";
-            case 0x04: return "Joystick";
-            case 0x05: return "Game Pad";
-            case 0x06: return "Keyboard";
-            case 0x07: return "Keypad";
-            case 0x08: return "Multi-axis Controller";
-            case 0x30: return "X";
-            case 0x31: return "Y";
-            case 0x32: return "Z";
-            case 0x33: return "Rx";
-            case 0x34: return "Ry";
-            case 0x35: return "Rz";
-            case 0x36: return "Slider";
-            case 0x37: return "Dial";
-            case 0x38: return "Wheel";
-            case 0x39: return "Hat switch";
-        }
+    switch (page) {
+        case 0x01:
+            switch (usage) {
+                case 0x00: return "Undefined";
+                case 0x01: return "Pointer";
+                case 0x02: return "Mouse";
+                case 0x04: return "Joystick";
+                case 0x05: return "Game Pad";
+                case 0x06: return "Keyboard";
+                case 0x07: return "Keypad";
+                case 0x08: return "Multi-axis Controller";
+                case 0x30: return "X";
+                case 0x31: return "Y";
+                case 0x32: return "Z";
+                case 0x33: return "Rx";
+                case 0x34: return "Ry";
+                case 0x35: return "Rz";
+                case 0x36: return "Slider";
+                case 0x37: return "Dial";
+                case 0x38: return "Wheel";
+                case 0x39: return "Hat switch";
+            }
+            break;
+        case 0x08:
+            switch (usage) {
+                case 0x01: return "Num Lock";
+                case 0x02: return "Caps Lock";
+                case 0x03: return "Scroll Lock";
+                case 0x04: return "Compose";
+                case 0x05: return "Kana";
+            }
+            break;
+        case 0x0C:
+            switch (usage) {
+                case 0x00: return "Unassigned";
+                case 0x01: return "Consumer Control";
+                case 0x30: return "Power";
+                case 0x32: return "Sleep";
+                case 0x38: return "Eject";
+                case 0xE9: return "Volume Increment";
+                case 0xEA: return "Volume Decrement";
+                case 0xE2: return "Mute";
+                case 0xB5: return "Scan Next Track";
+                case 0xB6: return "Scan Previous Track";
+                case 0xB0: return "Play";
+                case 0xB1: return "Pause";
+                case 0xCD: return "Play/Pause";
+                case 0xB7: return "Stop";
+            }
+            break;
     }
     return NULL;
 }
@@ -1375,6 +1477,8 @@ static GString *format_descriptor(const unsigned char *desc, int len) {
     int i = 0;
     int depth = 0;
     unsigned int last_usage_page = 0;
+    unsigned int usage_page_stack[MAX_GLOBAL_STACK];
+    int usage_page_sp = 0;
 
     while (i < len) {
         int start = i;
@@ -1438,7 +1542,8 @@ static GString *format_descriptor(const unsigned char *desc, int len) {
                     const char *n = usage_page_name(data);
                     if (n) snprintf(extra, sizeof(extra), "%s", n);
                     else if (data >= 0xFF00)
-                        snprintf(extra, sizeof(extra), "Vendor Defined (0x%04X)", data);
+                        snprintf(extra, sizeof(extra),
+                                 "Vendor Defined (0x%04X)", data);
                     last_usage_page = data;
                     break;
                 }
@@ -1451,8 +1556,18 @@ static GString *format_descriptor(const unsigned char *desc, int len) {
                 case 0x7: item_name = "REPORT_SIZE";      break;
                 case 0x8: item_name = "REPORT_ID";        break;
                 case 0x9: item_name = "REPORT_COUNT";     break;
-                case 0xA: item_name = "PUSH";             break;
-                case 0xB: item_name = "POP";              break;
+                case 0xA: {
+                    item_name = "PUSH";
+                    if (usage_page_sp < MAX_GLOBAL_STACK)
+                        usage_page_stack[usage_page_sp++] = last_usage_page;
+                    break;
+                }
+                case 0xB: {
+                    item_name = "POP";
+                    if (usage_page_sp > 0)
+                        last_usage_page = usage_page_stack[--usage_page_sp];
+                    break;
+                }
                 default:  item_name = "GLOBAL";           break;
             }
         } else if (type == 2) {
@@ -1497,6 +1612,11 @@ static GString *format_descriptor(const unsigned char *desc, int len) {
     return out;
 }
 
+/*
+ * The descriptor text is a multi-line blob; we render it as a single
+ * ListBox row with the "fixed" colour, using the raw markup path so it
+ * does not interfere with the meta/payload structure of log_to_tab.
+ */
 static void log_multiline_to_tab(ReportBOX *tab, const char *text) {
     if (!tab || !tab->input_view || !text) return;
 
@@ -1510,11 +1630,12 @@ static void log_multiline_to_tab(ReportBOX *tab, const char *text) {
     char *markup = g_strdup_printf("<span foreground='#c62872'>%s</span>", escaped);
     g_free(escaped);
 
-    tab_append_row(tab, markup);          /* whole descriptor = one row */
+    tab_append_row(tab, markup);
     g_free(markup);
 
     tab_trim_rows(tab);
 }
+
 /* ---------- Show Report Descriptor ---------- */
 
 static void on_show_descriptor(GtkButton *b, gpointer data) {
@@ -1547,9 +1668,9 @@ static void on_show_descriptor(GtkButton *b, gpointer data) {
     }
 
     char hdr[96];
-    snprintf(hdr, sizeof(hdr), "HID Report Descriptor (%d bytes)",
+    snprintf(hdr, sizeof(hdr), "HID Report Descriptor %2d bytes",
              app.raw_descriptor_len);
-    log_to_tab(tab, "DESC", hdr);
+    log_to_tab(tab, "DESC", hdr, NULL);
 
     GString *s = format_descriptor(app.raw_descriptor, app.raw_descriptor_len);
     log_multiline_to_tab(tab, s->str);
@@ -1565,12 +1686,24 @@ static void populate_devices(void) {
     GtkListStore *store = gtk_list_store_new(1, G_TYPE_STRING);
     GtkTreeIter iter;
 
+    /* Preserve current selection (if any) so refresh does not lose it. */
+    char *saved_id = NULL;
+    if (app.device_combo && app.device_ids) {
+        int sel = gtk_combo_box_get_active(GTK_COMBO_BOX(app.device_combo));
+        if (sel >= 0 && sel < (int)app.device_ids->len) {
+            const char *id = g_ptr_array_index(app.device_ids, sel);
+            if (id && *id) saved_id = g_strdup(id);
+        }
+    }
+
     g_ptr_array_set_size(app.device_paths, 0);
     if (app.device_ids) g_ptr_array_set_size(app.device_ids, 0);
 
     struct hid_device_info *devs = hid_enumerate(0, 0);
     int count = 0;
-    for (struct hid_device_info *cur = devs; cur && count < MAX_DEVICES; cur = cur->next) {
+    int new_sel = -1;
+    for (struct hid_device_info *cur = devs; cur && count < MAX_DEVICES;
+         cur = cur->next) {
         char mfg[128], prod[256];
         wchar_to_locale(cur->manufacturer_string, mfg, sizeof(mfg));
         wchar_to_locale(cur->product_string, prod, sizeof(prod));
@@ -1595,6 +1728,10 @@ static void populate_devices(void) {
         g_ptr_array_add(app.device_paths, g_strdup(cur->path));
         if (app.device_ids)
             g_ptr_array_add(app.device_ids, g_strdup(dev_id));
+
+        if (saved_id && strcmp(saved_id, dev_id) == 0)
+            new_sel = count;
+
         count++;
     }
     hid_free_enumeration(devs);
@@ -1602,7 +1739,12 @@ static void populate_devices(void) {
     gtk_combo_box_set_model(GTK_COMBO_BOX(app.device_combo), GTK_TREE_MODEL(store));
     g_object_unref(store);
 
-    apply_pending_device();
+    if (new_sel >= 0) {
+        gtk_combo_box_set_active(GTK_COMBO_BOX(app.device_combo), new_sel);
+    } else {
+        apply_pending_device();
+    }
+    g_free(saved_id);
 
     char msg[64];
     if (count)
@@ -1617,12 +1759,17 @@ static void populate_devices(void) {
 
 static void on_refresh_clicked(GtkButton *b, gpointer d) {
     (void)b; (void)d;
-    if (g_atomic_int_get(&app.connected)) return;
+    if (g_atomic_int_get(&app.connected)) {
+        gtk_label_set_text(GTK_LABEL(app.status_label),
+                           "Disconnect first to refresh device list");
+        return;
+    }
     populate_devices();
 }
 
 static void disconnect_device(void) {
     stop_reader_thread();
+    wait_for_hid_ops();
 
     g_mutex_lock(&app.hid_mutex);
     if (app.dev) { hid_close(app.dev); app.dev = NULL; }
@@ -1654,11 +1801,15 @@ static void connect_device(void) {
     }
     const char *path = g_ptr_array_index(app.device_paths, sel);
     if (!path) {
-        gtk_label_set_text(GTK_LABEL(app.status_label), "Selected device has no path");
+        gtk_label_set_text(GTK_LABEL(app.status_label),
+                           "Selected device has no path");
         return;
     }
 
     stop_reader_thread();
+    /* Make sure no sync op or manual read is still holding the device. */
+    wait_for_hid_ops();
+
     g_mutex_lock(&app.hid_mutex);
     if (app.dev) { hid_close(app.dev); app.dev = NULL; }
     g_mutex_unlock(&app.hid_mutex);
@@ -1676,7 +1827,6 @@ static void connect_device(void) {
     int n = hid_get_report_descriptor(dev, desc, sizeof(desc));
     if (n <= 0) {
         hid_close(dev);
-        /* Clear any stale descriptor from a previous connection. */
         g_free(app.raw_descriptor);
         app.raw_descriptor = NULL;
         app.raw_descriptor_len = 0;
@@ -1756,7 +1906,7 @@ static void connect_device(void) {
 
     char status[200];
     snprintf(status, sizeof(status),
-             "Connected. Descriptor: %d bytes, %d tab(s)%s",
+             "Connected. Descriptor: %2d bytes, %d tab(s)%s",
              n, app.tab_count,
              has_input ? "" : " (Feature/Output only, no reader)");
     gtk_label_set_text(GTK_LABEL(app.status_label), status);
@@ -1791,7 +1941,8 @@ static void on_hex_toggled(GtkToggleButton *b, gpointer data) {
             gtk_entry_set_placeholder_text(GTK_ENTRY(t->feature_entry), ph);
     }
 
-    gtk_label_set_text(GTK_LABEL(app.status_label), hex ? "Mode: HEX" : "Mode: ASCII");
+    gtk_label_set_text(GTK_LABEL(app.status_label),
+                       hex ? "Mode: HEX" : "Mode: ASCII");
 }
 
 /* ---------- font size spin ---------- */
@@ -1824,13 +1975,13 @@ static void on_window_destroy(GtkWidget *w, gpointer d) {
 
     save_config();
 
-    stop_reader_thread();
+    /* Prevent new operations from starting. */
     g_atomic_int_set(&app.connected, 0);
 
-    for (int i = 0; i < 30; i++) {
-        if (g_atomic_int_get(&app.manual_reads_active) == 0) break;
-        g_usleep(20 * 1000);
-    }
+    stop_reader_thread();
+    /* Wait until all sync and manual read threads have finished before
+     * touching hid_mutex or the device handle again. */
+    wait_for_hid_ops();
 
     g_mutex_lock(&app.hid_mutex);
     if (app.dev) { hid_close(app.dev); app.dev = NULL; }
@@ -1862,9 +2013,10 @@ int main(int argc, char *argv[]) {
     app.device_ids   = g_ptr_array_new_with_free_func(g_free);
     app.tabs_generation = 0;
     app.manual_reads_active = 0;
+    app.sync_ops_active = 0;
     app.raw_descriptor = NULL;
     app.raw_descriptor_len = 0;
-    app.log_font_size = 10;   /* overridden from spin button below */
+    app.log_font_size = 10;
 
     gtk_init(&argc, &argv);
 
@@ -1919,31 +2071,37 @@ int main(int argc, char *argv[]) {
     }
 
     gtk_window_set_title(GTK_WINDOW(app.window), WINTITLE);
-    if (app.auto_check && !gtk_button_get_label(GTK_BUTTON(app.auto_check)))
-        gtk_button_set_label(GTK_BUTTON(app.auto_check), "Auto");
+   // if (app.auto_check && !gtk_button_get_label(GTK_BUTTON(app.auto_check)))gtk_button_set_label(GTK_BUTTON(app.auto_check), "Auto");
 
     GtkCellRenderer *rend = gtk_cell_renderer_text_new();
     gtk_cell_layout_pack_start(GTK_CELL_LAYOUT(app.device_combo), rend, TRUE);
-    gtk_cell_layout_set_attributes(GTK_CELL_LAYOUT(app.device_combo), rend, "text", 0, NULL);
+    gtk_cell_layout_set_attributes(GTK_CELL_LAYOUT(app.device_combo),
+                                   rend, "text", 0, NULL);
 
-    g_signal_connect(app.refresh_button , "clicked", G_CALLBACK(on_refresh_clicked ), NULL);
-    g_signal_connect(app.connect_button , "clicked", G_CALLBACK(on_connect_clicked ), NULL);
-    g_signal_connect(app.clear_button   , "clicked", G_CALLBACK(on_clear_clicked   ), NULL);
-    g_signal_connect(app.hex_check      , "toggled", G_CALLBACK(on_hex_toggled     ), NULL);
-    g_signal_connect(app.show_descriptor_button, "clicked", G_CALLBACK(on_show_descriptor), NULL);
-    g_signal_connect(app.pause_button   , "clicked", G_CALLBACK(on_pause_clicked   ), NULL);
-    g_signal_connect(app.window         , "destroy", G_CALLBACK(on_window_destroy  ), NULL);
+    g_signal_connect(app.refresh_button , "clicked",
+                     G_CALLBACK(on_refresh_clicked ), NULL);
+    g_signal_connect(app.connect_button , "clicked",
+                     G_CALLBACK(on_connect_clicked ), NULL);
+    g_signal_connect(app.clear_button   , "clicked",
+                     G_CALLBACK(on_clear_clicked   ), NULL);
+    g_signal_connect(app.hex_check      , "toggled",
+                     G_CALLBACK(on_hex_toggled     ), NULL);
+    g_signal_connect(app.show_descriptor_button, "clicked",
+                     G_CALLBACK(on_show_descriptor), NULL);
+    g_signal_connect(app.pause_button   , "clicked",
+                     G_CALLBACK(on_pause_clicked   ), NULL);
+    g_signal_connect(app.window         , "destroy",
+                     G_CALLBACK(on_window_destroy  ), NULL);
     g_signal_connect(app.font_spin      , "value-changed",
                      G_CALLBACK(on_font_size_changed), NULL);
 
-    /* Initial defaults */
     g_atomic_int_set(&app.hex_mode, 0);
     g_atomic_int_set(&app.reader_paused, 0);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.hex_check), FALSE);
     update_pause_button();
 
-    /* Apply initial font size (value comes from the spin button in glade). */
-    apply_log_font_size(gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app.font_spin)));
+    apply_log_font_size(
+        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(app.font_spin)));
 
     g_object_unref(builder);
 
@@ -1956,9 +2114,18 @@ int main(int argc, char *argv[]) {
 
     gtk_main();
 
+    /* Final cleanup.  By now on_window_destroy has already waited for all
+     * in-flight HID operations, so we can safely destroy the mutex.  As a
+     * defensive measure, only clear it if no thread is still pending. */
+    if (g_atomic_int_get(&app.sync_ops_active) == 0 &&
+        g_atomic_int_get(&app.manual_reads_active) == 0) {
+        g_mutex_clear(&app.hid_mutex);
+    } else {
+        g_warning("main: HID operations still active at exit; leaking mutex");
+    }
+
     g_ptr_array_free(app.device_paths, TRUE);
     g_ptr_array_free(app.device_ids,   TRUE);
-    g_mutex_clear(&app.hid_mutex);
     g_free(cfg_path);
     g_free(pending_last_device);
     g_free(app.raw_descriptor);

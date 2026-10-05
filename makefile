@@ -1,5 +1,5 @@
 ﻿TARGET     	:= miahidpordo
-VERSION  	:= 17.3
+VERSION  	:= 17.4
 TITLE	 	:= MiaHIDPordo
 AUTOR		:=Mahmudrazliqli <mahmudrazliqli@yahoo.com>
 SECTION		:=electronics

@@ -11,5 +11,5 @@ Standards-Version: 4.6.0
 
 Package: @PACKAGENAME@
 Architecture: @ARCH@
-Depends: ${shlibs:Depends}, ${misc:Depends}
+Depends: ${shlibs:Depends}
 Description: @DESCRIPTION@
